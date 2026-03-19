@@ -214,8 +214,7 @@ def claude_transcribe_image(img_path)
         attempt += 1
         retry
       end
-      warning("Claude error for #{File.basename(img_path)}: #{e.message.lines.first.strip}. Falling back to Tesseract.")
-      nil
+      abort("Claude error for #{File.basename(img_path)}: #{e.message.lines.first.strip}")
     end
   end
 end
@@ -231,7 +230,6 @@ def claude_transcribe_pdf(pdf_path)
       $progress_bar&.status = "#{short_name(pdf_path)} #{i + 1}/#{images.size} [Claude]"
       info("  [Claude] Page #{i + 1}/#{images.size}...", verbose: $verbose)
       text = claude_transcribe_image(img)
-      return nil if text.nil?
       results << text
       results << "\n[PAGE BREAK (Page #{i + 1})]\n\n"
       sleep(0.3) if images.size > 1
