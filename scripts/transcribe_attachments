@@ -1,0 +1,484 @@
+#!/usr/bin/env ruby
+
+require 'fileutils'
+require 'tmpdir'
+require 'optparse'
+require 'base64'
+require 'dotenv/load'
+require 'anthropic'
+
+BASE_DIR     = File.expand_path('~/dossier')
+ATTACH_DIR   = File.join(BASE_DIR, 'work', 'attachments')
+SIDELOAD_DIR = File.join(BASE_DIR, 'sideload')
+TEXT_DIR     = File.join(BASE_DIR, 'cache', 'text')
+OUTPUT_FILE = File.join(BASE_DIR, 'work', 'attachments.txt')
+
+# Keywords for the index
+KEYWORDS = [/trust/i, /barbara/i, /jeremy/i, /schedule/i, /account/i, /agreement/i]
+
+OCRMYPDF_AVAILABLE  = system('which ocrmypdf > /dev/null 2>&1')
+CONVERT_AVAILABLE   = system('which convert > /dev/null 2>&1')
+CLAUDE_AVAILABLE    = !ENV['ANTHROPIC_API_KEY'].to_s.empty?
+CLAUDE_MODEL        = 'claude-sonnet-4-6'
+
+TRANSCRIBE_PROMPT = <<~PROMPT.freeze
+  Transcribe all text visible in this image exactly as it appears. This is a page from a legal or financial document related to a family court case and may include court filings, FOIA responses, probate records, financial statements, legal agreements, correspondence, or government forms.
+
+  Rules:
+  - Transcribe every word, number, date, and punctuation mark exactly as written, including headers, footers, page numbers, captions, signatures, stamps, and handwritten annotations.
+  - Preserve paragraph breaks and the relative layout of columns or tables using spacing or ASCII alignment where helpful.
+  - If text is partially obscured, smudged, or unclear, transcribe what is legible and mark uncertain characters with [?].
+  - Do not summarize, interpret, or omit any text — even boilerplate, repeated content, or marginalia.
+  - Output only the transcribed text with no commentary, labels, or explanation.
+PROMPT
+
+SUMMARY_PROMPT = <<~PROMPT.freeze
+  Analyze the following document text and respond with ONLY the fields below, exactly as formatted.
+  Do not add any explanation or extra text.
+
+  DOCUMENT_TYPE: <e.g. Court Filing, FOIA Response, Letter, Financial Statement, Legal Agreement, Medical Record, Email, Other>
+  DATE: <date of the document, or "Unknown">
+  PARTIES: <names of people or organizations involved, comma-separated>
+  SUBJECT: <one sentence describing what this document is about>
+  KEY_FACTS: <2-5 bullet points of the most important facts, each starting with "- ">
+PROMPT
+
+def info(message, verbose: false)
+  puts(message) if verbose
+end
+
+def warning(message)
+  $stderr.puts(message)
+end
+
+class ProgressBar
+  def initialize(total, output: $stderr, enabled: true)
+    @total   = total
+    @current = 0
+    @status  = ''
+    @output  = output
+    @enabled = enabled && @total.positive? && @output.tty?
+    render if @enabled
+  end
+
+  def status=(text)
+    @status = text.to_s
+    render if @enabled
+  end
+
+  def advance
+    return unless @enabled
+    @current += 1
+    @status = ''
+    render
+    finish if @current >= @total
+  end
+
+  def log(message)
+    return @output.puts(message) unless @enabled
+    clear_line
+    @output.puts(message)
+    render if @current < @total
+  end
+
+  private
+
+  def finish      = @output.puts
+  def clear_line  = @output.print("\r" + (' ' * 130) + "\r")
+
+  def render
+    width  = 30
+    ratio  = @current.fdiv(@total)
+    filled = (ratio * width).round
+    bar    = '=' * filled + ' ' * (width - filled)
+    base   = "\rProcessing [#{bar}] #{@current}/#{@total} #{(ratio * 100).round}%"
+    suffix = @status.empty? ? '' : " | #{@status}"
+    # Truncate suffix so total line fits in 120 cols
+    max_suffix = [120 - base.length, 0].max
+    @output.print(base + suffix[0, max_suffix])
+    @output.flush
+  end
+end
+
+def extract_text(file_path, extension, verbose: false, progress_bar: nil)
+  case extension
+  when '.docx', '.doc', '.rtf'
+    `textutil -convert txt -stdout "#{file_path}"`
+  when '.jpg', '.jpeg', '.png', '.tiff', '.tif'
+    if verbose
+      msg = "  (Running OCR on image: #{File.basename(file_path)}...)"
+      progress_bar ? progress_bar.log(msg) : $stderr.puts(msg)
+    end
+    ocr_image(file_path)
+  when '.pdf'
+    pdf_info = `pdfinfo "#{file_path}" 2>/dev/null`
+    pages = pdf_info.match(/Pages:\s+(\d+)/)&.[](1).to_i || 1
+
+    # Extract text per page; send all pages to AI or OCR scans only.
+    result = ''
+    (1..pages).each do |n|
+      $progress_bar&.status = "#{short_name(file_path)} #{n}/#{pages}"
+      if $use_ai && $ai_all_pages && CLAUDE_AVAILABLE
+        result << perform_ocr_page(file_path, n)
+      else
+        page_text = `pdftotext -f #{n} -l #{n} "#{file_path}" - 2>/dev/null`.strip
+        if page_text.length < 50
+          if verbose
+            msg = "  (Page #{n}/#{pages} is a scan - Running OCR...)"
+            progress_bar ? progress_bar.log(msg) : $stderr.puts(msg)
+          end
+          result << perform_ocr_page(file_path, n)
+        else
+          result << page_text
+        end
+      end
+      result << "\n\n" if n < pages
+    end
+    result
+  when '.txt'
+    File.read(file_path) rescue ""
+  else
+    ""
+  end
+end
+
+# Send a single image to Claude for transcription. Returns nil on failure.
+def claude_transcribe_image(img_path)
+  info("  [Claude] Sending image: #{File.basename(img_path)}", verbose: $verbose)
+  Dir.mktmpdir do |dir|
+    # Resize to keep well under the 5MB API limit
+    src = img_path
+    if CONVERT_AVAILABLE
+      resized = File.join(dir, 'resized.png')
+      system("convert '#{img_path}' -resize '2000x2000>' '#{resized}' 2>/dev/null")
+      src = resized if File.exist?(resized)
+    end
+    data = Base64.strict_encode64(File.binread(src))
+    client = Anthropic::Client.new
+    response = client.messages.create(
+      model: CLAUDE_MODEL,
+      max_tokens: 4096,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: data } },
+          { type: 'text', text: TRANSCRIBE_PROMPT }
+        ]
+      }]
+    )
+    text = response.content.first.text
+    chars = text.length
+    info("  [Claude] Response: #{chars} chars (#{(chars / 5.0).round} est. words)", verbose: $verbose)
+    text
+  end
+rescue => e
+  warning("Claude API error for #{File.basename(img_path)}: #{e.message}. Falling back to Tesseract.")
+  nil
+end
+
+# Rasterize a PDF and send each page to Claude. Returns nil if any page fails.
+def claude_transcribe_pdf(pdf_path)
+  results = ''
+  Dir.mktmpdir do |dir|
+    system("pdftoppm -png -r 150 '#{pdf_path}' '#{dir}/page'")
+    images = Dir.glob("#{dir}/page*.png").sort_by { |f| f.match(/page-?(\d+)\.png$/)[1].to_i }
+    info("  [Claude] Transcribing #{images.size} page(s) for: #{File.basename(pdf_path)}", verbose: $verbose)
+    images.each_with_index do |img, i|
+      $progress_bar&.status = "#{short_name(pdf_path)} #{i + 1}/#{images.size} [Claude]"
+      info("  [Claude] Page #{i + 1}/#{images.size}...", verbose: $verbose)
+      text = claude_transcribe_image(img)
+      return nil if text.nil?
+      results << text
+      results << "\n[PAGE BREAK (Page #{i + 1})]\n\n"
+      sleep(0.3) if images.size > 1
+    end
+  end
+  results
+end
+
+# Preprocess an image for best Tesseract results, then OCR it.
+def ocr_image(img_path)
+  if $use_ai && CLAUDE_AVAILABLE
+    result = claude_transcribe_image(img_path)
+    return result if result
+  end
+  if CONVERT_AVAILABLE
+    Dir.mktmpdir do |dir|
+      processed = File.join(dir, 'processed.png')
+      system("convert '#{img_path}' -colorspace gray -deskew 20% '#{processed}' 2>/dev/null")
+      src = File.exist?(processed) ? processed : img_path
+      `tesseract "#{src}" stdout --psm 1 --oem 3 -l eng 2>/dev/null`.strip
+    end
+  else
+    `tesseract "#{img_path}" stdout --psm 1 --oem 3 -l eng 2>/dev/null`.strip
+  end
+end
+
+# OCR a single page of a PDF (used when only some pages are scans).
+def perform_ocr_page(pdf_path, page_num)
+  Dir.mktmpdir do |dir|
+    system("pdftoppm -png -r 400 -f #{page_num} -l #{page_num} '#{pdf_path}' '#{dir}/page'")
+    img = Dir.glob("#{dir}/page*.png").first
+    return '' unless img
+    ocr_image(img)
+  end
+end
+
+# Primary PDF OCR: try Claude first, then ocrmypdf, then page-by-page fallback.
+def perform_ocr(pdf_path)
+  if $use_ai && CLAUDE_AVAILABLE
+    result = claude_transcribe_pdf(pdf_path)
+    return result if result
+  end
+  if OCRMYPDF_AVAILABLE
+    Dir.mktmpdir do |dir|
+      out = File.join(dir, 'out.pdf')
+      system("ocrmypdf --force-ocr --deskew --optimize 0 --quiet '#{pdf_path}' '#{out}' 2>/dev/null")
+      return `pdftotext "#{out}" - 2>/dev/null`.strip if File.exist?(out)
+    end
+  end
+  perform_ocr_fallback(pdf_path)
+end
+
+# Fallback: rasterize at 400 DPI and OCR each page image.
+def perform_ocr_fallback(pdf_path)
+  ocr_results = ""
+  Dir.mktmpdir do |dir|
+    system("pdftoppm -png -r 400 '#{pdf_path}' '#{dir}/page'")
+    images = Dir.glob("#{dir}/page*.png").sort_by { |f| f.match(/page-?(\d+)\.png$/)[1].to_i }
+    images.each_with_index do |img, i|
+      text = ocr_image(img)
+      ocr_results << text
+      ocr_results << "\n[PAGE BREAK (Page #{i+1})]\n\n"
+    end
+  end
+  ocr_results
+end
+
+def normalize_text(raw_text)
+  return "" if raw_text.nil?
+  text = raw_text.gsub(/\f/, "\n\n[PAGE BREAK]\n\n")
+  text = text.gsub(/\r\n?/, "\n")
+  text = text.gsub(/[^\x20-\x7E\t\n]/, "") # Strip non-printables
+  text.gsub(/\n{3,}/, "\n\n") # Collapse whitespace
+end
+
+def short_name(path)
+  name = File.basename(path)
+  return name if name.length <= 40
+  ext  = File.extname(name)
+  "#{File.basename(name, ext)[0, 40 - ext.length - 3]}...#{ext}"
+end
+
+# Generate an AI summary of extracted text. Returns nil if AI unavailable or fails.
+def claude_summarize(text, filename)
+  return nil unless $use_ai && CLAUDE_AVAILABLE
+  return nil if text.strip.empty?
+
+  # Use at most ~8000 chars to keep prompt cost low
+  excerpt = text[0, 8000]
+  client = Anthropic::Client.new
+  response = client.messages.create(
+    model: CLAUDE_MODEL,
+    max_tokens: 512,
+    messages: [{
+      role: 'user',
+      content: "#{SUMMARY_PROMPT}\n\n--- DOCUMENT TEXT ---\n#{excerpt}"
+    }]
+  )
+  response.content.first.text.strip
+rescue => e
+  warning("Claude summary error for #{filename}: #{e.message}")
+  nil
+end
+
+def format_summary_header(summary, filename, generated_at)
+  <<~HEADER
+    <<<SUMMARY
+    FILE: #{filename}
+    GENERATED: #{generated_at}
+    #{summary}
+    SUMMARY>>>
+
+  HEADER
+end
+
+def parse_summary(text)
+  block = text[/<<<SUMMARY\n(.*?)\nSUMMARY>>>/m, 1] || ''
+  {
+    document_type: block[/^DOCUMENT_TYPE:\s*(.+)/, 1]&.strip || 'Unknown',
+    date:          block[/^DATE:\s*(.+)/, 1]&.strip          || 'Unknown',
+    parties:       block[/^PARTIES:\s*(.+)/, 1]&.strip       || '',
+    subject:       block[/^SUBJECT:\s*(.+)/, 1]&.strip       || '',
+  }
+end
+
+def needs_conversion?(source_path, text_path)
+  return true unless File.exist?(text_path)
+  File.mtime(source_path) > File.mtime(text_path)
+end
+
+def run(verbose:, show_progress:)
+  info("Generating comprehensive text compilation (with OCR)...", verbose: verbose)
+  FileUtils.mkdir_p(TEXT_DIR)
+
+  source_dirs = [ATTACH_DIR, SIDELOAD_DIR].select { |d| Dir.exist?(d) }
+  all_files = ['.pdf', '.docx', '.doc', '.rtf', '.txt', '.jpg', '.jpeg', '.png', '.tiff', '.tif'].flat_map do |ext|
+    source_dirs.flat_map { |dir| Dir.glob(File.join(dir, "*#{ext}")) }
+  end.sort_by { |f| File.basename(f) }
+
+  # --- Pass 1: Extract text from attachments, skipping up-to-date cached files ---
+  to_convert = all_files.select { |f| needs_conversion?(f, File.join(TEXT_DIR, "#{File.basename(f)}.txt")) }
+
+  info("#{all_files.size} attachments found. #{to_convert.size} need conversion.", verbose: verbose)
+
+  bar = ProgressBar.new(to_convert.size, enabled: show_progress)
+  $progress_bar = bar
+
+  to_convert.each do |file|
+    ext = File.extname(file).downcase
+    filename = File.basename(file)
+    info("Converting: #{filename}...", verbose: verbose)
+
+    raw_text = extract_text(file, ext, verbose: verbose, progress_bar: bar)
+    clean_text = normalize_text(raw_text)
+
+    $progress_bar&.status = "#{short_name(file)} [Fetching Summary]"
+    info("  [Claude] Generating summary for #{filename}...", verbose: verbose)
+    summary = claude_summarize(clean_text, filename)
+    header  = summary ? format_summary_header(summary, filename, Time.now) : ''
+
+    File.write(File.join(TEXT_DIR, "#{filename}.txt"), header + clean_text)
+    bar.advance
+  end
+
+  # --- Pass 1.5: Add summaries to cached files that are missing them ---
+  if $use_ai && CLAUDE_AVAILABLE
+    needs_summary = all_files.select do |f|
+      text_path = File.join(TEXT_DIR, "#{File.basename(f)}.txt")
+      File.exist?(text_path) && !File.read(text_path).start_with?('<<<SUMMARY')
+    end
+
+    unless needs_summary.empty?
+      info("\n#{needs_summary.size} cached file(s) missing summaries — fetching...", verbose: verbose)
+      sum_bar = ProgressBar.new(needs_summary.size, enabled: show_progress)
+      $progress_bar = sum_bar
+
+      needs_summary.each do |file|
+        filename  = File.basename(file)
+        text_path = File.join(TEXT_DIR, "#{filename}.txt")
+        existing  = File.read(text_path)
+
+        sum_bar.status = "#{short_name(file)} [Fetching Summary]"
+        info("  [Claude] Generating summary for #{filename}...", verbose: verbose)
+        summary = claude_summarize(existing, filename)
+        if summary
+          header = format_summary_header(summary, filename, Time.now)
+          File.write(text_path, header + existing)
+        end
+        sum_bar.advance
+      end
+    end
+  end
+
+  # --- Pass 2: Build compilation from cached text files ---
+  info("\nBuilding compilation from text cache...", verbose: verbose)
+
+  # Collect metadata for all files, date-sorted
+  docs = all_files.sort.map.with_index(1) do |file, idx|
+    filename  = File.basename(file)
+    text_path = File.join(TEXT_DIR, "#{filename}.txt")
+    content   = File.exist?(text_path) ? File.read(text_path) : ""
+    meta      = parse_summary(content)
+    keywords  = KEYWORDS.select { |k| content =~ k }.map { |k| k.source.gsub('/i', '') }
+    { id: idx, filename: filename, content: content, meta: meta, keywords: keywords }
+  end
+
+  # --- Index file: summaries only ---
+  index_path = File.join(BASE_DIR, 'work', 'index.txt')
+  File.open(index_path, 'w') do |f|
+    f.puts "DOCUMENT INDEX - #{Time.now}"
+    f.puts "===================================================="
+    f.puts "#{docs.size} documents\n\n"
+    docs.each do |doc|
+      f.puts "[#{doc[:id].to_s.rjust(3, '0')}] #{doc[:meta][:date].ljust(12)} | #{doc[:meta][:document_type].ljust(22)} | #{doc[:filename]}"
+      f.puts "       Parties: #{doc[:meta][:parties]}" unless doc[:meta][:parties].empty?
+      f.puts "       Subject: #{doc[:meta][:subject]}" unless doc[:meta][:subject].empty?
+      f.puts "       Keywords: #{doc[:keywords].join(', ')}" unless doc[:keywords].empty?
+      f.puts
+    end
+  end
+  info("Index written: #{index_path}", verbose: verbose)
+
+  # --- Split files by document type ---
+  type_groups = docs.group_by { |d| d[:meta][:document_type] }
+  type_files  = {}
+  type_groups.each do |doc_type, group|
+    safe_type = doc_type.downcase.gsub(/[^a-z0-9]+/, '_').gsub(/^_|_$/, '')
+    type_path = File.join(BASE_DIR, 'work', "docs_#{safe_type}.txt")
+    type_files[doc_type] = type_path
+    File.open(type_path, 'w') do |f|
+      f.puts "#{doc_type.upcase} DOCUMENTS - #{Time.now}"
+      f.puts "===================================================="
+      f.puts "#{group.size} document(s)\n\n"
+      group.each do |doc|
+        f.puts "FILE_START [#{doc[:id].to_s.rjust(3, '0')}]: #{doc[:filename]}"
+        f.puts "----------------------------------------------------"
+        f.puts doc[:content]
+        f.puts "\n----------------------------------------------------"
+        f.puts "FILE_END [#{doc[:id].to_s.rjust(3, '0')}]: #{doc[:filename]}\n\n"
+      end
+    end
+    info("  Written: #{File.basename(type_path)} (#{group.size} docs)", verbose: verbose)
+  end
+
+  # --- Main compilation with richer TOC ---
+  File.open(OUTPUT_FILE, 'w') do |f|
+    f.puts "ATTACHED TEXT COMPILATION - #{Time.now}"
+    f.puts "===================================================="
+    f.puts "#{docs.size} documents\n\n"
+
+    f.puts "TABLE OF CONTENTS"
+    f.puts "----------------------------------------------------"
+    docs.each do |doc|
+      f.puts "[#{doc[:id].to_s.rjust(3, '0')}] #{doc[:meta][:date].ljust(12)} | #{doc[:meta][:document_type].ljust(22)} | #{doc[:meta][:subject]}"
+    end
+    f.puts "\n" + ("=" * 52) + "\n\n"
+
+    docs.each do |doc|
+      f.puts "FILE_START [#{doc[:id].to_s.rjust(3, '0')}]: #{doc[:filename]}"
+      f.puts "----------------------------------------------------"
+      f.puts doc[:content]
+      f.puts "\n----------------------------------------------------"
+      f.puts "FILE_END [#{doc[:id].to_s.rjust(3, '0')}]: #{doc[:filename]}\n\n"
+    end
+  end
+
+  info("\nSuccess! Outputs written to work/:", verbose: verbose)
+  info("  attachments.txt (all docs)", verbose: verbose)
+  info("  index.txt (summaries only)", verbose: verbose)
+  type_files.each { |type, path| info("  #{File.basename(path)}", verbose: verbose) }
+end
+
+options = { verbose: false, show_progress: true, use_ai: true, ai_all_pages: true }
+
+OptionParser.new do |parser|
+  parser.on('-v', '--verbose', 'Print informational output to stdout') do
+    options[:verbose] = true
+  end
+  parser.on('--no-progress', 'Disable progress bar output') do
+    options[:show_progress] = false
+  end
+  parser.on('--no-ai', 'Disable Claude AI transcription, use local OCR only') do
+    options[:use_ai] = false
+  end
+  parser.on('--no-ai-all-pages', 'Only send scanned pages to AI; use pdftotext for digital text pages') do
+    options[:ai_all_pages] = false
+  end
+end.parse!
+
+$use_ai       = options[:use_ai]
+$ai_all_pages = options[:ai_all_pages]
+$verbose      = options[:verbose]
+
+run(verbose: options[:verbose], show_progress: options[:show_progress])

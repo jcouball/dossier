@@ -1,0 +1,177 @@
+#!/usr/bin/env ruby
+
+require 'mail'
+require 'date'
+require 'optparse'
+
+BASE_DIR = File.expand_path('~/dossier')
+INPUT_MBOX = File.join(BASE_DIR, 'work', 'clean_emails.mbox')
+OUTPUT_FILE = File.join(BASE_DIR, 'work', 'emails.txt')
+PACIFIC_OFFSET = '-07:00'
+
+def info(message, verbose: false)
+  puts(message) if verbose
+end
+
+def warning(message)
+  $stderr.puts(message)
+end
+
+class ProgressBar
+  def initialize(total, output: $stderr, enabled: true)
+    @total   = total
+    @current = 0
+    @output  = output
+    @enabled = enabled && @total.positive? && @output.tty?
+    render if @enabled
+  end
+
+  def advance
+    return unless @enabled
+    @current += 1
+    render
+    finish if @current >= @total
+  end
+
+  def log(message)
+    return @output.puts(message) unless @enabled
+    clear_line
+    @output.puts(message)
+    render if @current < @total
+  end
+
+  private
+
+  def finish      = @output.puts
+  def clear_line  = @output.print("\r" + (' ' * 80) + "\r")
+
+  def render
+    width  = 30
+    ratio  = @current.fdiv(@total)
+    filled = (ratio * width).round
+    bar    = '=' * filled + ' ' * (width - filled)
+    @output.print("\rProcessing [#{bar}] #{@current}/#{@total} #{(ratio * 100).round}%")
+    @output.flush
+  end
+end
+
+def normalize_text(text)
+  return "" if text.nil?
+  text.gsub(/\r\n?/, "\n").gsub(/[^\x20-\x7E\t\n]/, "").gsub(/\n{3,}/, "\n\n")
+end
+
+def strip_html(text)
+  return "" if text.nil?
+  # Remove script/style blocks and their content
+  text = text.gsub(/<(script|style)[^>]*>.*?<\/\1>/im, '')
+  # Remove all other tags
+  text = text.gsub(/<[^>]+>/, ' ')
+  # Decode common HTML entities
+  text.gsub(/&nbsp;/, ' ').gsub(/&amp;/, '&').gsub(/&lt;/, '<')
+      .gsub(/&gt;/, '>').gsub(/&quot;/, '"').gsub(/&#39;/, "'")
+end
+
+def recover_date(mail)
+  # 1. Standard Date Header
+  return mail.date.to_time if mail.date
+
+  # 2. Check the 'Received' headers
+  if mail['Received']
+    begin
+      date_str = mail['Received'].to_s.split(';').last.strip
+      return DateTime.parse(date_str).to_time
+    rescue
+      nil
+    end
+  end
+
+  # 3. Fallback to common Gmail/Yahoo fetch headers
+  ['X-Gmail-Fetch-Time', 'X-Received', 'Date'].each do |h|
+    if mail[h]
+      begin
+        return DateTime.parse(mail[h].to_s.split(';').last.strip).to_time
+      rescue
+        next
+      end
+    end
+  end
+  nil
+end
+
+def format_message(mail, recovered_time)
+  timestamp = recovered_time ? recovered_time.to_datetime.new_offset(PACIFIC_OFFSET).strftime("%Y-%m-%d %H:%M:%S PT") : "[NO DATE FOUND]"
+
+  msg =  "MESSAGE_START\n"
+  msg << "----------------------------------------------------\n"
+  msg << "DATE:    #{timestamp}\n"
+  msg << "FROM:    #{mail.from&.join(', ')}\n"
+  msg << "TO:      #{mail.to&.join(', ')}\n"
+  msg << "SUBJECT: #{mail.subject}\n"
+  msg << "----------------------------------------------------\n"
+
+  if mail.multipart?
+    text = mail.text_part
+    html = mail.html_part
+    body_content = text ? text.decoded : strip_html(html&.decoded.to_s)
+  else
+    body_content = mail.body.decoded
+  end
+  msg << normalize_text(body_content)
+  msg << "\n----------------------------------------------------\n"
+  msg << "MESSAGE_END\n\n"
+end
+
+def run(verbose:, show_progress:)
+  info("Processing emails from #{File.basename(INPUT_MBOX)}...", verbose: verbose)
+
+  all_messages = []
+  current_raw_mail = ""
+  no_date_count = 0
+
+  File.foreach(INPUT_MBOX) do |line|
+    if line.start_with?("From ") && !current_raw_mail.empty?
+      all_messages << Mail.new(current_raw_mail.sub(/^From .*?\n/, ""))
+      current_raw_mail = ""
+    end
+    current_raw_mail << line
+  end
+  all_messages << Mail.new(current_raw_mail.sub(/^From .*?\n/, "")) unless current_raw_mail.empty?
+
+  bar = ProgressBar.new(all_messages.size, enabled: show_progress)
+
+  # Map messages to their recovered times and sort
+  processed_data = all_messages.map do |m|
+    time = recover_date(m)
+    no_date_count += 1 if time.nil?
+    bar.advance
+    { mail: m, time: time }
+  end
+
+  sorted_data = processed_data.sort_by { |entry| entry[:time] ? entry[:time].to_i : 0 }
+
+  File.open(OUTPUT_FILE, 'w') do |f|
+    f.puts "CHRONOLOGICAL EMAIL COMPILATION - #{Time.now}"
+    f.puts "====================================================\n\n"
+    sorted_data.each { |entry| f.puts format_message(entry[:mail], entry[:time]) }
+  end
+
+  info("----------------------------------------------------", verbose: verbose)
+  info("Process Complete.", verbose: verbose)
+  info("Total Emails:    #{all_messages.size}", verbose: verbose)
+  info("Missing Dates:   #{no_date_count}", verbose: verbose)
+  info("Compilation:     #{File.basename(OUTPUT_FILE)}", verbose: verbose)
+  info("----------------------------------------------------", verbose: verbose)
+end
+
+options = { verbose: false, show_progress: true }
+
+OptionParser.new do |parser|
+  parser.on('-v', '--verbose', 'Print informational output to stdout') do
+    options[:verbose] = true
+  end
+  parser.on('--no-progress', 'Disable progress bar output') do
+    options[:show_progress] = false
+  end
+end.parse!
+
+run(verbose: options[:verbose], show_progress: options[:show_progress])

@@ -1,0 +1,37 @@
+#!/usr/bin/env ruby
+
+BASE_DIR = File.expand_path('~/dossier')
+ATTACH_DIR = File.join(BASE_DIR, 'work', 'attachments')
+
+# Threshold: If a PDF has fewer than this many characters per page, it's a scan.
+CHARS_PER_PAGE_THRESHOLD = 20
+
+puts "Scanning for image-based PDFs (scans) in /attachments..."
+puts "----------------------------------------------------"
+
+pdfs = Dir.glob(File.join(ATTACH_DIR, "*.pdf")).sort
+scan_count = 0
+
+pdfs.each do |pdf|
+  filename = File.basename(pdf)
+
+  # 1. Extract raw text content
+  raw_text = `pdftotext "#{pdf}" - 2>/dev/null`.strip
+
+  # 2. Get page count
+  info = `pdfinfo "#{pdf}" 2>/dev/null`
+  pages = info.match(/Pages:\s+(\d+)/)&.[](1).to_i || 1
+
+  # Calculate if it's a scan
+  if raw_text.length < (pages * CHARS_PER_PAGE_THRESHOLD)
+    puts "[SCAN] #{filename.ljust(40)} (#{pages} pgs, #{raw_text.length} chars)"
+    scan_count += 1
+  end
+end
+
+puts "----------------------------------------------------"
+puts "Detection Complete."
+puts "Total Scans Found: #{scan_count}"
+if scan_count > 0
+  puts "Note: These files contain no searchable text and should be OCR'd or uploaded directly."
+end

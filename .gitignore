@@ -1,0 +1,19 @@
+# Input source (private)
+exported.mbox
+
+# Generated output
+work/
+context/
+cache/
+dateless_audit.txt
+
+# Sideloaded documents (private)
+sideload/*
+!sideload/.gitkeep
+
+# Ruby
+Gemfile.lock
+.bundle/
+
+# Secrets
+.env

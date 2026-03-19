@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -e
+
+# Install Homebrew if not present
+if ! command -v brew &>/dev/null; then
+  echo "Installing Homebrew..."
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+fi
+
+echo "Installing brew dependencies..."
+brew install poppler tesseract ocrmypdf imagemagick
+
+echo "Installing Ruby gems..."
+gem install bundler --conservative
+bundle install
+
+echo "Done. Run 'rake' to process your dossier."

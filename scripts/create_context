@@ -1,0 +1,138 @@
+#!/usr/bin/env ruby
+
+require 'fileutils'
+require 'optparse'
+
+BASE_DIR    = File.expand_path('~/dossier')
+ATTACH_DIR   = File.join(BASE_DIR, 'work', 'attachments')
+SIDELOAD_DIR = File.join(BASE_DIR, 'sideload')
+CONTEXT_DIR = File.join(BASE_DIR, 'context')
+
+def info(message, verbose: false)
+  puts(message) if verbose
+end
+
+def warning(message)
+  $stderr.puts(message)
+end
+
+class ProgressBar
+  def initialize(total, output: $stderr, enabled: true)
+    @total   = total
+    @current = 0
+    @output  = output
+    @enabled = enabled && @total.positive? && @output.tty?
+    render if @enabled
+  end
+
+  def advance
+    return unless @enabled
+    @current += 1
+    render
+    finish if @current >= @total
+  end
+
+  def log(message)
+    return @output.puts(message) unless @enabled
+    clear_line
+    @output.puts(message)
+    render if @current < @total
+  end
+
+  private
+
+  def finish      = @output.puts
+  def clear_line  = @output.print("\r" + (' ' * 80) + "\r")
+
+  def render
+    width  = 30
+    ratio  = @current.fdiv(@total)
+    filled = (ratio * width).round
+    bar    = '=' * filled + ' ' * (width - filled)
+    @output.print("\rProcessing [#{bar}] #{@current}/#{@total} #{(ratio * 100).round}%")
+    @output.flush
+  end
+end
+
+def run(verbose: false, show_progress: true)
+  info "Preparing the Forensic Context directory...", verbose: verbose
+
+  # 1. Clear the context directory
+  if Dir.exist?(CONTEXT_DIR)
+    info "Cleaning out old context files...", verbose: verbose
+    FileUtils.rm_rf(Dir.glob("#{CONTEXT_DIR}/*"))
+  else
+    info "Creating context directory...", verbose: verbose
+    FileUtils.mkdir_p(CONTEXT_DIR)
+  end
+
+  attached   = File.join(BASE_DIR, 'work', 'attachments.txt')
+  index_file = File.join(BASE_DIR, 'work', 'index.txt')
+  email_file = File.join(BASE_DIR, 'work', 'emails.txt')
+  type_files = Dir.glob(File.join(BASE_DIR, 'work', 'docs_*.txt'))
+  xlsx_dirs  = [ATTACH_DIR, SIDELOAD_DIR].select { |d| Dir.exist?(d) }
+  xlsx_files = xlsx_dirs.flat_map { |d| Dir.glob(File.join(d, '*.xlsx')) }
+
+  candidates = [attached, index_file, email_file] + type_files + xlsx_files
+  total = candidates.count { |f| File.exist?(f) }
+  bar   = ProgressBar.new(total, enabled: show_progress)
+
+  # 2. Copy attachments.txt
+  if File.exist?(attached)
+    FileUtils.cp(attached, CONTEXT_DIR)
+    info "Copied: #{File.basename(attached)}", verbose: verbose
+    bar.advance
+  else
+    bar.log("Warning: attachments.txt not found")
+  end
+
+  # 3. Copy index.txt (summaries only)
+  if File.exist?(index_file)
+    FileUtils.cp(index_file, CONTEXT_DIR)
+    info "Copied: index.txt", verbose: verbose
+    bar.advance
+  else
+    bar.log("Warning: index.txt not found — run transcribe_attachments first")
+  end
+
+  # 4. Copy emails.txt
+  if File.exist?(email_file)
+    FileUtils.cp(email_file, CONTEXT_DIR)
+    info "Copied: emails.txt", verbose: verbose
+    bar.advance
+  else
+    bar.log("Warning: emails.txt not found in #{BASE_DIR}")
+  end
+
+  # 5. Copy per-type document files
+  type_files.each do |file|
+    FileUtils.cp(file, CONTEXT_DIR)
+    info "Copied: #{File.basename(file)}", verbose: verbose
+    bar.advance
+  end
+
+  # 6. Copy all .xlsx files from attachments
+  xlsx_files.each do |file|
+    FileUtils.cp(file, CONTEXT_DIR)
+    info "Copied: #{File.basename(file)}", verbose: verbose
+    bar.advance
+  end
+
+  info "----------------------------------------------------", verbose: verbose
+  info "Sync Complete. Your context directory is ready.", verbose: verbose
+  info "Location: #{CONTEXT_DIR}", verbose: verbose
+  info "----------------------------------------------------", verbose: verbose
+end
+
+options = { verbose: false, show_progress: true }
+
+OptionParser.new do |parser|
+  parser.on('-v', '--verbose', 'Print informational output to stdout') do
+    options[:verbose] = true
+  end
+  parser.on('--no-progress', 'Disable progress bar output') do
+    options[:show_progress] = false
+  end
+end.parse!
+
+run(verbose: options[:verbose], show_progress: options[:show_progress])

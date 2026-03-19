@@ -1,0 +1,65 @@
+#!/usr/bin/env ruby
+
+require 'fileutils'
+
+# Helper method to convert raw bytes into human-readable formats
+def format_size(bytes)
+  return "0 B" if bytes == 0
+  units = ['B', 'KB', 'MB', 'GB', 'TB']
+  exp = (Math.log(bytes) / Math.log(1024)).to_i
+  exp = units.size - 1 if exp > units.size - 1
+  sprintf("%.2f %s", bytes.to_f / (1024 ** exp), units[exp])
+end
+
+def analyze_extensions(attachment_dir)
+  dir_path = File.expand_path(attachment_dir)
+
+  unless Dir.exist?(dir_path)
+    puts "Error: Directory not found at #{dir_path}"
+    return
+  end
+
+  # Initialize a hash where missing keys default to count: 0 and size: 0
+  stats = Hash.new { |hash, key| hash[key] = { count: 0, size: 0 } }
+  total_files = 0
+  total_size = 0
+
+  puts "Analyzing attachments in #{dir_path}...\n\n"
+
+  # Iterate through all files
+  Dir.glob(File.join(dir_path, '*')).each do |file_path|
+    next if File.directory?(file_path)
+
+    # Extract extension, normalize to lowercase, handle files without extensions
+    ext = File.extname(file_path).downcase
+    ext = "(no extension)" if ext.empty?
+
+    file_size = File.size(file_path)
+
+    # Update counts and sizes
+    stats[ext][:count] += 1
+    stats[ext][:size] += file_size
+
+    total_files += 1
+    total_size += file_size
+  end
+
+  # Sort the results by total size (descending)
+  sorted_stats = stats.sort_by { |_, data| -data[:size] }
+
+  # Print a formatted table
+  puts sprintf("%-15s | %-10s | %-15s", "Extension", "Count", "Total Size")
+  puts "-" * 45
+
+  sorted_stats.each do |ext, data|
+    formatted_size = format_size(data[:size])
+    puts sprintf("%-15s | %-10d | %-15s", ext, data[:count], formatted_size)
+  end
+
+  puts "-" * 45
+  puts sprintf("%-15s | %-10d | %-15s", "TOTAL", total_files, format_size(total_size))
+end
+
+# Target the specific attachments directory
+attachments_dir = '~/dossier/work/attachments'
+analyze_extensions(attachments_dir)

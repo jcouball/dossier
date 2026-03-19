@@ -1,0 +1,59 @@
+#!/usr/bin/env ruby
+
+require 'tmpdir'
+require 'fileutils'
+
+# Usage: ruby test_ocr.rb "attachments/your_file.pdf"
+
+if ARGV.empty?
+  puts "Usage: ruby test_ocr.rb <path_to_pdf>"
+  exit
+end
+
+file_path = ARGV[0]
+
+unless File.exist?(file_path)
+  puts "Error: File not found at #{file_path}"
+  exit
+end
+
+puts "--- Starting Forensic OCR Test ---"
+puts "Target: #{File.basename(file_path)}"
+
+Dir.mktmpdir do |dir|
+  puts "1. Converting PDF to 300dpi PNGs in #{dir}..."
+  # -sep "" ensures page numbers follow immediately (page1.png, page2.png)
+  # -r 300 is the high-res standard
+  system("pdftoppm -png -r 300 '#{file_path}' #{dir}/page")
+
+  images = Dir.glob("#{dir}/page*.png").sort_by do |f|
+    # Extract the number from 'page-1.png' or 'page1.png'
+    f.match(/page-?(\d+)\.png$/)[1].to_i
+  end
+
+  if images.empty?
+    puts "FAILED: No images were generated. Check if 'poppler' is installed correctly."
+    exit
+  end
+
+  puts "2. Found #{images.size} pages. Starting Tesseract..."
+
+  images.each_with_index do |img, i|
+    print "   Processing Page #{i+1}... "
+
+    # Run Tesseract and capture stdout
+    # 2>/dev/null hides the Tesseract "Estimating resolution" logs
+    text = `tesseract "#{img}" stdout 2>/dev/null`.strip
+
+    if text.empty?
+      puts "EMPTY (No text detected on this page)"
+    else
+      puts "SUCCESS (#{text.length} characters found)"
+      puts "--- PREVIEW (First 100 chars) ---"
+      puts text[0..100].gsub("\n", " ")
+      puts "---------------------------------"
+    end
+  end
+end
+
+puts "--- Test Complete ---"

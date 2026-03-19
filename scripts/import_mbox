@@ -1,0 +1,178 @@
+#!/usr/bin/env ruby
+
+require 'mail'
+require 'fileutils'
+require 'date'
+require 'optparse'
+
+PACIFIC_OFFSET = '-07:00'
+
+class ProgressBar
+  def initialize(total, output: $stderr, enabled: true)
+    @total = total
+    @current = 0
+    @output = output
+    @enabled = enabled && @total.positive? && @output.tty?
+    render if @enabled
+  end
+
+  def advance
+    return unless @enabled
+
+    @current += 1
+    render
+    finish if @current >= @total
+  end
+
+  def log(message)
+    return @output.puts(message) unless @enabled
+
+    clear_line
+    @output.puts(message)
+    render if @current < @total
+  end
+
+  private
+
+  def finish
+    @output.puts
+  end
+
+  def render
+    width = 30
+    ratio = @total.zero? ? 1.0 : @current.fdiv(@total)
+    filled = (ratio * width).round
+    bar = '=' * filled + ' ' * (width - filled)
+    percent = (ratio * 100).round
+    @output.print("\rProcessing [#{bar}] #{@current}/#{@total} #{percent}%")
+    @output.flush
+  end
+
+  def clear_line
+    @output.print("\r" + (' ' * 80) + "\r")
+  end
+end
+
+def info(message, verbose: false)
+  puts(message) if verbose
+end
+
+def warning(message, progress_bar: nil)
+  if progress_bar
+    progress_bar.log(message)
+  else
+    $stderr.puts(message)
+  end
+end
+
+def count_messages(input_path)
+  File.foreach(input_path).count { |line| line.start_with?("From ") }
+end
+
+def clean_mbox_with_custom_attachments(input_path, output_path, attachment_dir, verbose: false, show_progress: true)
+  FileUtils.mkdir_p(attachment_dir)
+
+  current_raw_mail = ""
+  progress_bar = ProgressBar.new(count_messages(input_path), enabled: show_progress)
+
+  File.open(output_path, 'w') do |output_file|
+    File.foreach(input_path) do |line|
+      if line.start_with?("From ") && !current_raw_mail.empty?
+        process_message(current_raw_mail, output_file, attachment_dir, verbose: verbose, progress_bar: progress_bar)
+        progress_bar.advance
+        current_raw_mail = ""
+      end
+      current_raw_mail << line
+    end
+    # Process the final message
+    unless current_raw_mail.empty?
+      process_message(current_raw_mail, output_file, attachment_dir, verbose: verbose, progress_bar: progress_bar)
+      progress_bar.advance
+    end
+  end
+
+  info("Processing complete. Clean MBOX saved to: #{output_path}", verbose: verbose)
+end
+
+def process_message(raw_msg, output_file, attachment_dir, verbose: false, progress_bar: nil)
+  mail = Mail.new(raw_msg)
+
+  # 1. Generate Timestamp
+  timestamp = "00000000T000000"
+  if mail.date
+    pt_time = mail.date.to_datetime.new_offset(PACIFIC_OFFSET)
+    timestamp = pt_time.strftime("%Y%m%dT%H%M%S")
+  end
+
+  # 2. Extract and Sanitize Subject
+  raw_subject = mail.subject || "No_Subject"
+  safe_subject = raw_subject.gsub(/[^0-9a-z.\- ]/i, '_').gsub(/\s+/, ' ').strip[0..79]
+
+  # 3. Extract Username
+  from_address = mail.from&.first || "unknown"
+  username = from_address.split('@').first.gsub(/[^0-9a-z]/i, '_')
+
+  # 4. Extract and Save Attachments (with Manual Fix Protection)
+  mail.attachments.each do |attachment|
+    safe_attachment_name = attachment.filename.gsub(/[^0-9a-z.\- ]/i, '_')
+    base_filename = "#{timestamp} - #{safe_subject} (#{username}) - #{safe_attachment_name}"
+    target_filepath = File.join(attachment_dir, base_filename)
+
+    # SHIELD LOGIC: If the file exists, we assume it's already been processed/corrected.
+    if File.exist?(target_filepath)
+      info("Skipping attachment (Preserving existing/corrected version): #{base_filename}", verbose: verbose)
+      next # Move to the next attachment without overwriting
+    end
+
+    File.write(target_filepath, attachment.body.decoded)
+    info("Saved new attachment: #{File.basename(target_filepath)}", verbose: verbose)
+  end
+
+  # 5. Clean the MBOX payload while preserving headers
+  output_content_type = 'text/plain'
+  output_body = mail.body.decoded
+
+  if mail.multipart?
+    text_part = mail.text_part || mail.html_part
+    if text_part
+      output_body = text_part.decoded
+      output_content_type = text_part.mime_type || 'text/plain'
+    end
+
+    mail.parts.clear
+    mail.body.boundary = nil
+  end
+
+  mail.content_transfer_encoding = nil
+  mail.content_type = "#{output_content_type}; charset=UTF-8"
+  mail.body = output_body
+  mail.charset = 'UTF-8'
+
+  output_file.puts "From " + mail.to_s
+  output_file.puts "\n"
+end
+
+base_dir = File.expand_path('~/dossier')
+input_mbox = File.join(base_dir, 'exported.mbox')
+output_mbox = File.join(base_dir, 'work', 'clean_emails.mbox')
+attachments_dir = File.join(base_dir, 'work', 'attachments')
+
+options = { verbose: false, show_progress: true }
+
+OptionParser.new do |parser|
+  parser.on('-v', '--verbose', 'Print informational output to stdout') do
+    options[:verbose] = true
+  end
+
+  parser.on('--no-progress', 'Disable progress bar output') do
+    options[:show_progress] = false
+  end
+end.parse!
+
+clean_mbox_with_custom_attachments(
+  input_mbox,
+  output_mbox,
+  attachments_dir,
+  verbose: options[:verbose],
+  show_progress: options[:show_progress]
+)

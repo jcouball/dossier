@@ -1,0 +1,138 @@
+#!/usr/bin/env ruby
+
+require 'digest'
+require 'optparse'
+require 'fileutils'
+
+def info(message, verbose: false)
+  puts(message) if verbose
+end
+
+def warning(message)
+  $stderr.puts(message)
+end
+
+class ProgressBar
+  def initialize(total, output: $stderr, enabled: true)
+    @total   = total
+    @current = 0
+    @output  = output
+    @enabled = enabled && @total.positive? && @output.tty?
+    render if @enabled
+  end
+
+  def advance
+    return unless @enabled
+    @current += 1
+    render
+    finish if @current >= @total
+  end
+
+  def log(message)          # use for warnings during a run
+    return @output.puts(message) unless @enabled
+    clear_line
+    @output.puts(message)
+    render if @current < @total
+  end
+
+  private
+
+  def finish      = @output.puts
+  def clear_line  = @output.print("\r" + (' ' * 80) + "\r")
+
+  def render
+    width  = 30
+    ratio  = @current.fdiv(@total)
+    filled = (ratio * width).round
+    bar    = '=' * filled + ' ' * (width - filled)
+    @output.print("\rProcessing [#{bar}] #{@current}/#{@total} #{(ratio * 100).round}%")
+    @output.flush
+  end
+end
+
+# Setup command-line options
+options = { delete: false, verbose: false, show_progress: true }
+OptionParser.new do |opts|
+  opts.banner = "Usage: ruby deduplicate.rb [options]"
+
+  opts.on("-d", "--delete", "Execute actual deletion of duplicate files. Without this, the script runs in DRY RUN mode.") do
+    options[:delete] = true
+  end
+  opts.on('-v', '--verbose', 'Print informational output to stdout') do
+    options[:verbose] = true
+  end
+  opts.on('--no-progress', 'Disable progress bar output') do
+    options[:show_progress] = false
+  end
+end.parse!
+
+def deduplicate_attachments(attachment_dir, really_delete, verbose:, show_progress:)
+  dir_path = File.expand_path(attachment_dir)
+
+  unless Dir.exist?(dir_path)
+    $stderr.puts "Error: Directory not found at #{dir_path}"
+    return
+  end
+
+  # Visual indicator of the current mode
+  info "========================================", verbose: verbose
+  info(really_delete ? "⚠️  MODE: ACTIVE DELETION ⚠️" : "🛡️  MODE: DRY RUN (No files will be changed) 🛡️", verbose: verbose)
+  info "========================================", verbose: verbose
+  info "Scanning files...", verbose: verbose
+
+  # Collect all files up front for progress tracking
+  all_files = Dir.glob(File.join(dir_path, '*')).reject { |f| File.directory?(f) }
+  bar = ProgressBar.new(all_files.size, enabled: show_progress)
+
+  # Group files by their MD5 checksums
+  checksums = Hash.new { |hash, key| hash[key] = [] }
+
+  all_files.each do |file_path|
+    file_md5 = Digest::MD5.file(file_path).hexdigest
+    checksums[file_md5] << file_path
+    bar.advance
+  end
+
+  duplicate_count = 0
+  freed_space = 0
+
+  checksums.each do |md5, files|
+    # If an MD5 has more than one file associated with it, we have duplicates
+    if files.size > 1
+      # Because filenames start with YYYYMMDDTHHMMSS, alphabetical sort
+      # automatically places the earliest timestamp at index 0.
+      sorted_files = files.sort
+
+      original = sorted_files.first
+      duplicates = sorted_files[1..-1]
+
+      info "\nFound #{duplicates.size} duplicate(s) for: #{File.basename(original)}", verbose: verbose
+
+      duplicates.each do |dup_file|
+        duplicate_count += 1
+        freed_space += File.size(dup_file)
+
+        if really_delete
+          File.delete(dup_file)
+          info "  [DELETED] -> #{File.basename(dup_file)}", verbose: verbose
+        else
+          info "  [WOULD DELETE] -> #{File.basename(dup_file)}", verbose: verbose
+        end
+      end
+    end
+  end
+
+  # Summary statistics
+  info "\n--- Summary ---", verbose: verbose
+  info "Duplicates identified: #{duplicate_count}", verbose: verbose
+  space_mb = (freed_space.to_f / (1024 * 1024)).round(2)
+
+  if really_delete
+    info "Space freed: #{space_mb} MB", verbose: verbose
+  else
+    info "Space that would be freed: #{space_mb} MB", verbose: verbose
+  end
+end
+
+attachments_dir = '~/dossier/work/attachments'
+deduplicate_attachments(attachments_dir, options[:delete], verbose: options[:verbose], show_progress: options[:show_progress])

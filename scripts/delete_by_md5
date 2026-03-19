@@ -1,0 +1,127 @@
+#!/usr/bin/env ruby
+
+require 'digest'
+require 'optparse'
+
+def info(message, verbose: false)
+  puts(message) if verbose
+end
+
+def warning(message)
+  $stderr.puts(message)
+end
+
+class ProgressBar
+  def initialize(total, output: $stderr, enabled: true)
+    @total   = total
+    @current = 0
+    @output  = output
+    @enabled = enabled && @total.positive? && @output.tty?
+    render if @enabled
+  end
+
+  def advance
+    return unless @enabled
+    @current += 1
+    render
+    finish if @current >= @total
+  end
+
+  def log(message)          # use for warnings during a run
+    return @output.puts(message) unless @enabled
+    clear_line
+    @output.puts(message)
+    render if @current < @total
+  end
+
+  private
+
+  def finish      = @output.puts
+  def clear_line  = @output.print("\r" + (' ' * 80) + "\r")
+
+  def render
+    width  = 30
+    ratio  = @current.fdiv(@total)
+    filled = (ratio * width).round
+    bar    = '=' * filled + ' ' * (width - filled)
+    @output.print("\rProcessing [#{bar}] #{@current}/#{@total} #{(ratio * 100).round}%")
+    @output.flush
+  end
+end
+
+# Array of MD5 checksums to target for deletion
+TARGET_MD5S = [
+  'bfd87e02e5de8d1dc16d3fd2cd9d8507',
+  'dc445961e973e0beffb52836c5074a8a',
+  '6b205fdf9481f75661c92cae90ac64ba',
+  '39aee4c61541e6a2a3ba84ae37a068e3',
+  '15ae7af03334dba790a3f1a793d4faa9',
+  '6929372fd05d30f0d6cde60f7a905d32',
+  '5ed4bf11f65b4aec94b4bded50d01c71',
+  'e3bd398c51dfd9aee3bea863dcb0554b',
+  'c9724ca746eb754d059917e19f82f5c8',
+  'baf739e26a9f8d5816671b627511137c',
+  'c9290011256179f43e2235d14f7be678',
+  'e7b57c9d661b124bd8e06bb0221521a9',
+  'f7709311d2ba2d190cc1c050bf240976',
+  '67bd499763ba8212069cf3e526590396',
+  '67bd499763ba8212069cf3e526590396',
+  '9772db6076f0927e224f85e66ad68f7f',
+  '44560b968eb399433b7b27eb989b3218',
+  'e0f72c1aac05b8541f6d9cec9192c086',
+  'fea4206aef9d99e84ee6545494a9d87a',
+  '220566234a0f2c66708f8d10bd053e11',
+  'a3fa45ce43a7bb42feb92492db09b060',
+
+].freeze
+
+options = { verbose: false, show_progress: true }
+OptionParser.new do |parser|
+  parser.on('-v', '--verbose', 'Print informational output to stdout') do
+    options[:verbose] = true
+  end
+  parser.on('--no-progress', 'Disable progress bar output') do
+    options[:show_progress] = false
+  end
+end.parse!
+
+def delete_matching_attachments(attachment_dir, verbose:, show_progress:)
+  dir_path = File.expand_path(attachment_dir)
+
+  unless Dir.exist?(dir_path)
+    $stderr.puts "Error: Directory not found at #{dir_path}"
+    return
+  end
+
+  deleted_count = 0
+
+  info "Scanning for files matching the provided MD5 checksums...", verbose: verbose
+
+  # Collect all files up front for progress tracking
+  all_files = Dir.glob(File.join(dir_path, '*')).reject { |f| File.directory?(f) }
+  bar = ProgressBar.new(all_files.size, enabled: show_progress)
+
+  # Iterate through all files in the directory
+  all_files.each do |file_path|
+    # Calculate MD5 checksum
+    file_md5 = Digest::MD5.file(file_path).hexdigest
+
+    # Check if the file's MD5 is in our target array
+    if TARGET_MD5S.include?(file_md5)
+      File.delete(file_path)
+      info "Deleted: #{File.basename(file_path)} (Matched MD5: #{file_md5})", verbose: verbose
+      deleted_count += 1
+    end
+
+    bar.advance
+  end
+
+  info "---", verbose: verbose
+  info "Scan complete.", verbose: verbose
+  info "Files scanned: #{all_files.size}", verbose: verbose
+  info "Files deleted: #{deleted_count}", verbose: verbose
+end
+
+# Target the specific attachments directory
+attachments_dir = '~/dossier/work/attachments'
+delete_matching_attachments(attachments_dir, verbose: options[:verbose], show_progress: options[:show_progress])
