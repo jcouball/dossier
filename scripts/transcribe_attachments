@@ -10,8 +10,9 @@ require 'anthropic'
 BASE_DIR     = File.expand_path('~/dossier')
 ATTACH_DIR   = File.join(BASE_DIR, 'work', 'attachments')
 SIDELOAD_DIR = File.join(BASE_DIR, 'sideload')
-TEXT_DIR     = File.join(BASE_DIR, 'cache', 'text')
-OUTPUT_FILE = File.join(BASE_DIR, 'work', 'attachments.txt')
+TEXT_DIR       = File.join(BASE_DIR, 'cache', 'text')
+PAGE_CACHE_DIR = File.join(TEXT_DIR, 'pages')
+OUTPUT_FILE    = File.join(BASE_DIR, 'work', 'attachments.txt')
 
 # Keywords for the index
 KEYWORDS = [/trust/i, /barbara/i, /jeremy/i, /schedule/i, /account/i, /agreement/i]
@@ -20,6 +21,9 @@ OCRMYPDF_AVAILABLE  = system('which ocrmypdf > /dev/null 2>&1')
 CONVERT_AVAILABLE   = system('which convert > /dev/null 2>&1')
 CLAUDE_AVAILABLE    = !ENV['ANTHROPIC_API_KEY'].to_s.empty?
 CLAUDE_MODEL        = 'claude-sonnet-4-6'
+THREAD_POOL_SIZE    = 5
+CLAUDE_MAX_RETRIES  = 6     # up to ~2 min total wait
+CLAUDE_RETRY_BASE   = 2.0   # seconds; delay = base^attempt (2, 4, 8, 16, 32, 64)
 
 TRANSCRIBE_PROMPT = <<~PROMPT.freeze
   Transcribe all text visible in this image exactly as it appears. This is a page from a legal or financial document related to a family court case and may include court filings, FOIA responses, probate records, financial statements, legal agreements, correspondence, or government forms.
@@ -100,6 +104,50 @@ class ProgressBar
   end
 end
 
+# Process all pages of a PDF in parallel using a thread pool, caching each page
+# individually. Pages already cached are skipped; results are always assembled in order.
+def process_pdf_pages_parallel(file_path, pages, verbose:, progress_bar:)
+  filename = File.basename(file_path)
+  FileUtils.mkdir_p(PAGE_CACHE_DIR)
+
+  pending = (1..pages).reject { |n| File.exist?(page_cache_path(filename, n)) }
+  return if pending.empty?
+
+  queue = Queue.new
+  mutex = Mutex.new
+  # Start completed count from however many pages are already cached
+  completed = pages - pending.size
+  $progress_bar&.status = "#{short_name(file_path)} #{completed}/#{pages}"
+  pending.each { |n| queue << n }
+
+  Array.new([THREAD_POOL_SIZE, pending.size].min) do
+    Thread.new do
+      while (n = queue.pop(true) rescue nil)
+        page_text = if $use_ai && $ai_all_pages && CLAUDE_AVAILABLE
+          perform_ocr_page(file_path, n)
+        else
+          pt = `pdftotext -f #{n} -l #{n} "#{file_path}" - 2>/dev/null`.strip
+          if pt.length < 50
+            if verbose
+              msg = "  (Page #{n}/#{pages} is a scan - Running OCR...)"
+              mutex.synchronize { progress_bar ? progress_bar.log(msg) : $stderr.puts(msg) }
+            end
+            perform_ocr_page(file_path, n)
+          else
+            pt
+          end
+        end
+
+        File.write(page_cache_path(filename, n), page_text.to_s)
+        mutex.synchronize do
+          completed += 1
+          $progress_bar&.status = "#{short_name(file_path)} #{completed}/#{pages}"
+        end
+      end
+    end
+  end.each(&:join)
+end
+
 def extract_text(file_path, extension, verbose: false, progress_bar: nil)
   case extension
   when '.docx', '.doc', '.rtf'
@@ -113,28 +161,10 @@ def extract_text(file_path, extension, verbose: false, progress_bar: nil)
   when '.pdf'
     pdf_info = `pdfinfo "#{file_path}" 2>/dev/null`
     pages = pdf_info.match(/Pages:\s+(\d+)/)&.[](1).to_i || 1
+    filename = File.basename(file_path)
 
-    # Extract text per page; send all pages to AI or OCR scans only.
-    result = ''
-    (1..pages).each do |n|
-      $progress_bar&.status = "#{short_name(file_path)} #{n}/#{pages}"
-      if $use_ai && $ai_all_pages && CLAUDE_AVAILABLE
-        result << perform_ocr_page(file_path, n)
-      else
-        page_text = `pdftotext -f #{n} -l #{n} "#{file_path}" - 2>/dev/null`.strip
-        if page_text.length < 50
-          if verbose
-            msg = "  (Page #{n}/#{pages} is a scan - Running OCR...)"
-            progress_bar ? progress_bar.log(msg) : $stderr.puts(msg)
-          end
-          result << perform_ocr_page(file_path, n)
-        else
-          result << page_text
-        end
-      end
-      result << "\n\n" if n < pages
-    end
-    result
+    process_pdf_pages_parallel(file_path, pages, verbose: verbose, progress_bar: progress_bar)
+    (1..pages).map { |n| File.read(page_cache_path(filename, n)) }.join("\n\n")
   when '.txt'
     File.read(file_path) rescue ""
   else
@@ -142,7 +172,9 @@ def extract_text(file_path, extension, verbose: false, progress_bar: nil)
   end
 end
 
-# Send a single image to Claude for transcription. Returns nil on failure.
+# Send a single image to Claude for transcription.
+# Retries with exponential backoff on rate-limit (429) and transient (5xx) errors.
+# Returns nil only on a non-retryable failure.
 def claude_transcribe_image(img_path)
   info("  [Claude] Sending image: #{File.basename(img_path)}", verbose: $verbose)
   Dir.mktmpdir do |dir|
@@ -154,26 +186,38 @@ def claude_transcribe_image(img_path)
       src = resized if File.exist?(resized)
     end
     data = Base64.strict_encode64(File.binread(src))
-    client = Anthropic::Client.new
-    response = client.messages.create(
-      model: CLAUDE_MODEL,
-      max_tokens: 4096,
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: data } },
-          { type: 'text', text: TRANSCRIBE_PROMPT }
-        ]
-      }]
-    )
-    text = response.content.first.text
-    chars = text.length
-    info("  [Claude] Response: #{chars} chars (#{(chars / 5.0).round} est. words)", verbose: $verbose)
-    text
+
+    attempt = 0
+    begin
+      client = Anthropic::Client.new
+      response = client.messages.create(
+        model: CLAUDE_MODEL,
+        max_tokens: 4096,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: data } },
+            { type: 'text', text: TRANSCRIBE_PROMPT }
+          ]
+        }]
+      )
+      text = response.content.first.text
+      chars = text.length
+      info("  [Claude] Response: #{chars} chars (#{(chars / 5.0).round} est. words)", verbose: $verbose)
+      text
+    rescue => e
+      retryable = e.message =~ /429|rate.limit|overloaded|529|5\d\d/i
+      if retryable && attempt < CLAUDE_MAX_RETRIES
+        delay = CLAUDE_RETRY_BASE ** attempt
+        warning("  [Claude] #{e.message.lines.first.strip} — retrying in #{delay.round}s (attempt #{attempt + 1}/#{CLAUDE_MAX_RETRIES})...")
+        sleep(delay)
+        attempt += 1
+        retry
+      end
+      warning("Claude error for #{File.basename(img_path)}: #{e.message.lines.first.strip}. Falling back to Tesseract.")
+      nil
+    end
   end
-rescue => e
-  warning("Claude API error for #{File.basename(img_path)}: #{e.message}. Falling back to Tesseract.")
-  nil
 end
 
 # Rasterize a PDF and send each page to Claude. Returns nil if any page fails.
@@ -270,6 +314,10 @@ def short_name(path)
   "#{File.basename(name, ext)[0, 40 - ext.length - 3]}...#{ext}"
 end
 
+def page_cache_path(filename, page_num)
+  File.join(PAGE_CACHE_DIR, "#{filename}.p#{page_num}.txt")
+end
+
 # Generate an AI summary of extracted text. Returns nil if AI unavailable or fails.
 def claude_summarize(text, filename)
   return nil unless $use_ai && CLAUDE_AVAILABLE
@@ -315,6 +363,7 @@ end
 
 def needs_conversion?(source_path, text_path)
   return true unless File.exist?(text_path)
+  return true if Dir.glob(File.join(PAGE_CACHE_DIR, "#{File.basename(source_path)}.p*.txt")).any?
   File.mtime(source_path) > File.mtime(text_path)
 end
 
@@ -349,6 +398,7 @@ def run(verbose:, show_progress:)
     header  = summary ? format_summary_header(summary, filename, Time.now) : ''
 
     File.write(File.join(TEXT_DIR, "#{filename}.txt"), header + clean_text)
+    Dir.glob(File.join(PAGE_CACHE_DIR, "#{filename}.p*.txt")).each { |f| File.delete(f) }
     bar.advance
   end
 
