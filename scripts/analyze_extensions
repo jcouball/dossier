@@ -61,5 +61,5 @@ def analyze_extensions(attachment_dir)
 end
 
 # Target the specific attachments directory
-attachments_dir = '~/dossier/work/attachments'
+attachments_dir = File.expand_path('../work/attachments', __dir__)
 analyze_extensions(attachments_dir)

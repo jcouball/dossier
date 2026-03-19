@@ -1,6 +1,6 @@
 #!/usr/bin/env ruby
 
-BASE_DIR = File.expand_path('~/dossier')
+BASE_DIR = File.expand_path('..', __dir__)
 ATTACH_DIR = File.join(BASE_DIR, 'work', 'attachments')
 
 # Threshold: If a PDF has fewer than this many characters per page, it's a scan.

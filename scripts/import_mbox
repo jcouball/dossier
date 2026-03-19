@@ -152,7 +152,7 @@ def process_message(raw_msg, output_file, attachment_dir, verbose: false, progre
   output_file.puts "\n"
 end
 
-base_dir = File.expand_path('~/dossier')
+base_dir = File.expand_path('..', __dir__)
 input_mbox = File.join(base_dir, 'exported.mbox')
 output_mbox = File.join(base_dir, 'work', 'clean_emails.mbox')
 attachments_dir = File.join(base_dir, 'work', 'attachments')

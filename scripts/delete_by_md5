@@ -123,5 +123,5 @@ def delete_matching_attachments(attachment_dir, verbose:, show_progress:)
 end
 
 # Target the specific attachments directory
-attachments_dir = '~/dossier/work/attachments'
+attachments_dir = File.expand_path('../work/attachments', __dir__)
 delete_matching_attachments(attachments_dir, verbose: options[:verbose], show_progress: options[:show_progress])

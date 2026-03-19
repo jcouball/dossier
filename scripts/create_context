@@ -3,7 +3,7 @@
 require 'fileutils'
 require 'optparse'
 
-BASE_DIR    = File.expand_path('~/dossier')
+BASE_DIR    = File.expand_path('..', __dir__)
 ATTACH_DIR   = File.join(BASE_DIR, 'work', 'attachments')
 SIDELOAD_DIR = File.join(BASE_DIR, 'sideload')
 CONTEXT_DIR = File.join(BASE_DIR, 'context')

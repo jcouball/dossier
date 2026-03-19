@@ -7,7 +7,7 @@ require 'base64'
 require 'dotenv/load'
 require 'anthropic'
 
-BASE_DIR     = File.expand_path('~/dossier')
+BASE_DIR     = File.expand_path('..', __dir__)
 ATTACH_DIR   = File.join(BASE_DIR, 'work', 'attachments')
 SIDELOAD_DIR = File.join(BASE_DIR, 'sideload')
 TEXT_DIR       = File.join(BASE_DIR, 'cache', 'text')
@@ -209,7 +209,7 @@ def claude_transcribe_image(img_path)
       retryable = e.message =~ /429|rate.limit|overloaded|529|5\d\d/i
       if retryable && attempt < CLAUDE_MAX_RETRIES
         delay = CLAUDE_RETRY_BASE ** attempt
-        warning("  [Claude] #{e.message.lines.first.strip} — retrying in #{delay.round}s (attempt #{attempt + 1}/#{CLAUDE_MAX_RETRIES})...")
+        warning("  [Claude] #{e.message.lines.first.strip} — retrying in #{delay.round}s (attempt #{attempt + 1}/#{CLAUDE_MAX_RETRIES})...") if attempt >= 2
         sleep(delay)
         attempt += 1
         retry

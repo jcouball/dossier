@@ -134,5 +134,5 @@ def deduplicate_attachments(attachment_dir, really_delete, verbose:, show_progre
   end
 end
 
-attachments_dir = '~/dossier/work/attachments'
+attachments_dir = File.expand_path('../work/attachments', __dir__)
 deduplicate_attachments(attachments_dir, options[:delete], verbose: options[:verbose], show_progress: options[:show_progress])

@@ -4,7 +4,7 @@ require 'mail'
 require 'date'
 require 'optparse'
 
-BASE_DIR = File.expand_path('~/dossier')
+BASE_DIR = File.expand_path('..', __dir__)
 INPUT_MBOX = File.join(BASE_DIR, 'work', 'clean_emails.mbox')
 OUTPUT_FILE = File.join(BASE_DIR, 'work', 'emails.txt')
 PACIFIC_OFFSET = '-07:00'
