@@ -12,7 +12,6 @@ ATTACH_DIR   = File.join(BASE_DIR, 'work', 'attachments')
 SIDELOAD_DIR = File.join(BASE_DIR, 'sideload')
 TEXT_DIR       = File.join(BASE_DIR, 'cache', 'text')
 PAGE_CACHE_DIR = File.join(TEXT_DIR, 'pages')
-OUTPUT_FILE    = File.join(BASE_DIR, 'work', 'attachments.txt')
 
 # Keywords for the index
 KEYWORDS = [/trust/i, /barbara/i, /jeremy/i, /schedule/i, /account/i, /agreement/i]
@@ -40,28 +39,42 @@ SUMMARY_PROMPT = <<~PROMPT.freeze
   Analyze the following document text and respond with ONLY the fields below, exactly as formatted.
   Do not add any explanation or extra text.
 
-  DOCUMENT_TYPE: <e.g. Court Filing, FOIA Response, Letter, Financial Statement, Legal Agreement, Medical Record, Email, Other>
+  DOCUMENT_TYPE: <one of: Court, Financial, Medical, Other>
   DATE: <date of the document, or "Unknown">
   PARTIES: <names of people or organizations involved, comma-separated>
   SUBJECT: <one sentence describing what this document is about>
   KEY_FACTS: <2-5 bullet points of the most important facts, each starting with "- ">
 PROMPT
 
+def timestamp = Time.now.strftime('%H:%M:%S')
+
 def info(message, verbose: false)
-  puts(message) if verbose
+  return unless verbose
+  msg = "[#{timestamp}] #{message}"
+  if $progress_bar&.enabled?
+    $progress_bar.log(msg)
+  else
+    puts(msg)
+  end
 end
 
 def warning(message)
-  $stderr.puts(message)
+  msg = "[#{timestamp}] [WARN] #{message}"
+  if $progress_bar&.enabled?
+    $progress_bar.log(msg)
+  else
+    $stderr.puts(msg)
+  end
 end
 
 class ProgressBar
   def initialize(total, output: $stderr, enabled: true)
-    @total   = total
-    @current = 0
-    @status  = ''
-    @output  = output
-    @enabled = enabled && @total.positive? && @output.tty?
+    @total      = total
+    @current    = 0
+    @status     = ''
+    @output     = output
+    @enabled    = enabled && @total.positive? && @output.tty?
+    @last_len   = 0
     render if @enabled
   end
 
@@ -69,6 +82,8 @@ class ProgressBar
     @status = text.to_s
     render if @enabled
   end
+
+  def enabled? = @enabled
 
   def advance
     return unless @enabled
@@ -88,7 +103,7 @@ class ProgressBar
   private
 
   def finish      = @output.puts
-  def clear_line  = @output.print("\r" + (' ' * 130) + "\r")
+  def clear_line  = @output.print("\r" + (' ' * @last_len) + "\r")
 
   def render
     width  = 30
@@ -97,9 +112,11 @@ class ProgressBar
     bar    = '=' * filled + ' ' * (width - filled)
     base   = "\rProcessing [#{bar}] #{@current}/#{@total} #{(ratio * 100).round}%"
     suffix = @status.empty? ? '' : " | #{@status}"
-    # Truncate suffix so total line fits in 120 cols
-    max_suffix = [120 - base.length, 0].max
-    @output.print(base + suffix[0, max_suffix])
+    line   = base + suffix
+    # Pad to erase any leftover characters from the previous (longer) render
+    padded    = line.ljust(@last_len + 1)  # +1 for the leading \r
+    @last_len = line.length - 1            # exclude leading \r
+    @output.print(padded)
     @output.flush
   end
 end
@@ -178,18 +195,26 @@ end
 def claude_transcribe_image(img_path)
   info("  [Claude] Sending image: #{File.basename(img_path)}", verbose: $verbose)
   Dir.mktmpdir do |dir|
-    # Resize to keep well under the 5MB API limit
+    # Resize to keep under the 5 MB API limit; shrink progressively if needed
+    max_bytes = 5 * 1024 * 1024
     src = img_path
     if CONVERT_AVAILABLE
       resized = File.join(dir, 'resized.png')
-      system("convert '#{img_path}' -resize '2000x2000>' '#{resized}' 2>/dev/null")
-      src = resized if File.exist?(resized)
+      dim = 2000
+      loop do
+        system("convert '#{img_path}' -resize '#{dim}x#{dim}>' '#{resized}' 2>/dev/null")
+        break if !File.exist?(resized) || File.size(resized) <= max_bytes || dim <= 500
+        dim = (dim * 0.75).round
+      end
+      src = resized if File.exist?(resized) && File.size(resized) <= max_bytes
     end
     data = Base64.strict_encode64(File.binread(src))
 
     attempt = 0
     begin
-      client = Anthropic::Client.new
+      info("  [Claude] Waiting for response: #{File.basename(img_path)}...", verbose: $verbose)
+      t0 = Time.now
+      client = Anthropic::Client.new(timeout: 90, max_retries: 0)
       response = client.messages.create(
         model: CLAUDE_MODEL,
         max_tokens: 4096,
@@ -203,10 +228,19 @@ def claude_transcribe_image(img_path)
       )
       text = response.content.first.text
       chars = text.length
-      info("  [Claude] Response: #{chars} chars (#{(chars / 5.0).round} est. words)", verbose: $verbose)
+      elapsed = (Time.now - t0).round(1)
+      info("  [Claude] Response: #{chars} chars (#{(chars / 5.0).round} words) in #{elapsed}s", verbose: $verbose)
       text
     rescue => e
-      retryable = e.message =~ /429|rate.limit|overloaded|529|5\d\d/i
+      if e.message =~ /content.filter|output blocked/i
+        warning("  [Claude] Content filtering blocked #{File.basename(img_path)} — will fall back")
+        return nil
+      end
+      if e.message =~ /image exceeds.*maximum|exceeds.*5.*mb/i
+        warning("  [Claude] Image too large to send for #{File.basename(img_path)} — will fall back")
+        return nil
+      end
+      retryable = e.message =~ /429|rate.limit|overloaded|529|5\d\d|timeout|timed.out/i
       if retryable && attempt < CLAUDE_MAX_RETRIES
         delay = CLAUDE_RETRY_BASE ** attempt
         warning("  [Claude] #{e.message.lines.first.strip} — retrying in #{delay.round}s (attempt #{attempt + 1}/#{CLAUDE_MAX_RETRIES})...") if attempt >= 2
@@ -223,15 +257,36 @@ end
 def claude_transcribe_pdf(pdf_path)
   results = ''
   Dir.mktmpdir do |dir|
-    system("pdftoppm -png -r 150 '#{pdf_path}' '#{dir}/page'")
+    system("pdftoppm -png -r 150 '#{pdf_path}' '#{dir}/page' 2>/dev/null")
     images = Dir.glob("#{dir}/page*.png").sort_by { |f| f.match(/page-?(\d+)\.png$/)[1].to_i }
     info("  [Claude] Transcribing #{images.size} page(s) for: #{File.basename(pdf_path)}", verbose: $verbose)
     images.each_with_index do |img, i|
-      $progress_bar&.status = "#{short_name(pdf_path)} #{i + 1}/#{images.size} [Claude]"
-      info("  [Claude] Page #{i + 1}/#{images.size}...", verbose: $verbose)
+      page_num = i + 1
+      $progress_bar&.status = "#{short_name(pdf_path)} #{page_num}/#{images.size} [Claude]"
+      info("  [Claude] Page #{page_num}/#{images.size}...", verbose: $verbose)
       text = claude_transcribe_image(img)
-      results << text
-      results << "\n[PAGE BREAK (Page #{i + 1})]\n\n"
+      if text.nil?
+        # Content filtering fallback: use pdftotext if the page has selectable text, else Tesseract
+        pt = `pdftotext -f #{page_num} -l #{page_num} "#{pdf_path}" - 2>/dev/null`.strip
+        if pt.length >= 50
+          warning("  [Fallback] Page #{page_num}: content filtered — using pdftotext")
+          text = pt
+        else
+          warning("  [Fallback] Page #{page_num}: content filtered — using Tesseract")
+          text = if CONVERT_AVAILABLE
+            Dir.mktmpdir do |tdir|
+              processed = File.join(tdir, 'processed.png')
+              system("convert '#{img}' -colorspace gray -deskew 20% '#{processed}' 2>/dev/null")
+              src = File.exist?(processed) ? processed : img
+              `tesseract "#{src}" stdout --psm 1 --oem 3 -l eng 2>/dev/null`.strip
+            end
+          else
+            `tesseract "#{img}" stdout --psm 1 --oem 3 -l eng 2>/dev/null`.strip
+          end
+        end
+      end
+      results << text.to_s
+      results << "\n[PAGE BREAK (Page #{page_num})]\n\n"
       sleep(0.3) if images.size > 1
     end
   end
@@ -259,7 +314,7 @@ end
 # OCR a single page of a PDF (used when only some pages are scans).
 def perform_ocr_page(pdf_path, page_num)
   Dir.mktmpdir do |dir|
-    system("pdftoppm -png -r 400 -f #{page_num} -l #{page_num} '#{pdf_path}' '#{dir}/page'")
+    system("pdftoppm -png -r 400 -f #{page_num} -l #{page_num} '#{pdf_path}' '#{dir}/page' 2>/dev/null")
     img = Dir.glob("#{dir}/page*.png").first
     return '' unless img
     ocr_image(img)
@@ -286,7 +341,7 @@ end
 def perform_ocr_fallback(pdf_path)
   ocr_results = ""
   Dir.mktmpdir do |dir|
-    system("pdftoppm -png -r 400 '#{pdf_path}' '#{dir}/page'")
+    system("pdftoppm -png -r 400 '#{pdf_path}' '#{dir}/page' 2>/dev/null")
     images = Dir.glob("#{dir}/page*.png").sort_by { |f| f.match(/page-?(\d+)\.png$/)[1].to_i }
     images.each_with_index do |img, i|
       text = ocr_image(img)
@@ -323,7 +378,7 @@ def claude_summarize(text, filename)
 
   # Use at most ~8000 chars to keep prompt cost low
   excerpt = text[0, 8000]
-  client = Anthropic::Client.new
+  client = Anthropic::Client.new(timeout: 60, max_retries: 0)
   response = client.messages.create(
     model: CLAUDE_MODEL,
     max_tokens: 512,
@@ -351,8 +406,15 @@ end
 
 def parse_summary(text)
   block = text[/<<<SUMMARY\n(.*?)\nSUMMARY>>>/m, 1] || ''
+  raw_type = block[/^DOCUMENT_TYPE:\s*(.+)/, 1]&.strip || 'Other'
+  document_type = case raw_type.downcase
+    when /court|filing|foia|probate|wardship|deposition|legal/  then 'Court'
+    when /financ|statement|account|insurance|payment|tax/       then 'Financial'
+    when /medical|health|record|hospital|doctor/                then 'Medical'
+    else                                                             'Other'
+  end
   {
-    document_type: block[/^DOCUMENT_TYPE:\s*(.+)/, 1]&.strip || 'Unknown',
+    document_type: document_type,
     date:          block[/^DATE:\s*(.+)/, 1]&.strip          || 'Unknown',
     parties:       block[/^PARTIES:\s*(.+)/, 1]&.strip       || '',
     subject:       block[/^SUBJECT:\s*(.+)/, 1]&.strip       || '',
@@ -420,10 +482,13 @@ def run(verbose:, show_progress:)
         sum_bar.status = "#{short_name(file)} [Fetching Summary]"
         info("  [Claude] Generating summary for #{filename}...", verbose: verbose)
         summary = claude_summarize(existing, filename)
-        if summary
-          header = format_summary_header(summary, filename, Time.now)
-          File.write(text_path, header + existing)
+        header = if summary
+          format_summary_header(summary, filename, Time.now)
+        else
+          warning("Summary unavailable for #{filename} — writing stub to skip on future runs")
+          "<<<SUMMARY\nFILE: #{filename}\nGENERATED: #{Time.now}\nDOCUMENT_TYPE: Other\nDATE: Unknown\nPARTIES: \nSUBJECT: (summary unavailable)\nKEY_FACTS: \nSUMMARY>>>\n\n"
         end
+        File.write(text_path, header + existing)
         sum_bar.advance
       end
     end
@@ -459,6 +524,8 @@ def run(verbose:, show_progress:)
   info("Index written: #{index_path}", verbose: verbose)
 
   # --- Split files by document type ---
+  # Remove stale docs_*.txt files from previous runs before writing new ones
+  Dir.glob(File.join(BASE_DIR, 'work', 'docs_*.txt')).each { |f| File.delete(f) }
   type_groups = docs.group_by { |d| d[:meta][:document_type] }
   type_files  = {}
   type_groups.each do |doc_type, group|
@@ -480,30 +547,7 @@ def run(verbose:, show_progress:)
     info("  Written: #{File.basename(type_path)} (#{group.size} docs)", verbose: verbose)
   end
 
-  # --- Main compilation with richer TOC ---
-  File.open(OUTPUT_FILE, 'w') do |f|
-    f.puts "ATTACHED TEXT COMPILATION - #{Time.now}"
-    f.puts "===================================================="
-    f.puts "#{docs.size} documents\n\n"
-
-    f.puts "TABLE OF CONTENTS"
-    f.puts "----------------------------------------------------"
-    docs.each do |doc|
-      f.puts "[#{doc[:id].to_s.rjust(3, '0')}] #{doc[:meta][:date].ljust(12)} | #{doc[:meta][:document_type].ljust(22)} | #{doc[:meta][:subject]}"
-    end
-    f.puts "\n" + ("=" * 52) + "\n\n"
-
-    docs.each do |doc|
-      f.puts "FILE_START [#{doc[:id].to_s.rjust(3, '0')}]: #{doc[:filename]}"
-      f.puts "----------------------------------------------------"
-      f.puts doc[:content]
-      f.puts "\n----------------------------------------------------"
-      f.puts "FILE_END [#{doc[:id].to_s.rjust(3, '0')}]: #{doc[:filename]}\n\n"
-    end
-  end
-
   info("\nSuccess! Outputs written to work/:", verbose: verbose)
-  info("  attachments.txt (all docs)", verbose: verbose)
   info("  index.txt (summaries only)", verbose: verbose)
   type_files.each { |type, path| info("  #{File.basename(path)}", verbose: verbose) }
 end
