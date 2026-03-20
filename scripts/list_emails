@@ -1,0 +1,55 @@
+#!/usr/bin/env ruby
+
+require 'mail'
+require 'date'
+require 'optparse'
+
+BASE_DIR = File.expand_path('..', __dir__)
+DEFAULT_MBOX = File.join(BASE_DIR, 'exported.mbox')
+PACIFIC_OFFSET = '-07:00'
+
+options = { mbox: DEFAULT_MBOX }
+
+OptionParser.new do |opts|
+  opts.banner = "Usage: list_emails [options]"
+  opts.on('-f', '--file PATH', "Path to mbox file (default: exported.mbox)") { |v| options[:mbox] = v }
+  opts.on('-h', '--help', 'Show this help') { puts opts; exit }
+end.parse!
+
+mbox_path = options[:mbox]
+unless File.exist?(mbox_path)
+  $stderr.puts "Error: mbox file not found: #{mbox_path}"
+  exit 1
+end
+
+current_raw_mail = ""
+emails = []
+
+collect = lambda do |raw|
+  next if raw.strip.empty?
+
+  mail = Mail.new(raw)
+
+  sort_key = mail.date ? mail.date.to_datetime.new_offset(PACIFIC_OFFSET) : DateTime.new(0)
+  date_str = mail.date ? sort_key.strftime("%Y-%m-%d %H:%M") : "(no date)"
+  from     = mail['From']&.to_s || "(unknown sender)"
+  subject  = mail.subject || "(no subject)"
+
+  emails << { sort_key: sort_key, date_str: date_str, from: from, subject: subject }
+end
+
+File.foreach(mbox_path) do |line|
+  if line.start_with?("From ") && !current_raw_mail.empty?
+    collect.call(current_raw_mail)
+    current_raw_mail = ""
+  end
+  current_raw_mail << line
+end
+
+collect.call(current_raw_mail) unless current_raw_mail.empty?
+
+emails.sort_by! { |e| e[:sort_key] }
+
+emails.each_with_index do |e, i|
+  puts "%-5d  %-18s  %-40s  %s" % [i + 1, e[:date_str], e[:from][0..39], e[:subject]]
+end
