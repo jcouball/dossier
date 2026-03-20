@@ -66,27 +66,17 @@ def run(verbose: false, show_progress: true)
     FileUtils.mkdir_p(CONTEXT_DIR)
   end
 
-  attached   = File.join(BASE_DIR, 'work', 'attachments.txt')
   index_file = File.join(BASE_DIR, 'work', 'index.txt')
   email_file = File.join(BASE_DIR, 'work', 'emails.txt')
   type_files = Dir.glob(File.join(BASE_DIR, 'work', 'docs_*.txt'))
   xlsx_dirs  = [ATTACH_DIR, SIDELOAD_DIR].select { |d| Dir.exist?(d) }
   xlsx_files = xlsx_dirs.flat_map { |d| Dir.glob(File.join(d, '*.xlsx')) }
 
-  candidates = [attached, index_file, email_file] + type_files + xlsx_files
+  candidates = [index_file, email_file] + type_files + xlsx_files
   total = candidates.count { |f| File.exist?(f) }
   bar   = ProgressBar.new(total, enabled: show_progress)
 
-  # 2. Copy attachments.txt
-  if File.exist?(attached)
-    FileUtils.cp(attached, CONTEXT_DIR)
-    info "Copied: #{File.basename(attached)}", verbose: verbose
-    bar.advance
-  else
-    bar.log("Warning: attachments.txt not found")
-  end
-
-  # 3. Copy index.txt (summaries only)
+  # 2. Copy index.txt (summaries only)
   if File.exist?(index_file)
     FileUtils.cp(index_file, CONTEXT_DIR)
     info "Copied: index.txt", verbose: verbose
@@ -95,7 +85,7 @@ def run(verbose: false, show_progress: true)
     bar.log("Warning: index.txt not found — run transcribe_attachments first")
   end
 
-  # 4. Copy emails.txt
+  # 2. Copy emails.txt
   if File.exist?(email_file)
     FileUtils.cp(email_file, CONTEXT_DIR)
     info "Copied: emails.txt", verbose: verbose
@@ -104,14 +94,14 @@ def run(verbose: false, show_progress: true)
     bar.log("Warning: emails.txt not found in #{BASE_DIR}")
   end
 
-  # 5. Copy per-type document files
+  # 3. Copy per-type document files
   type_files.each do |file|
     FileUtils.cp(file, CONTEXT_DIR)
     info "Copied: #{File.basename(file)}", verbose: verbose
     bar.advance
   end
 
-  # 6. Copy all .xlsx files from attachments
+  # 4. Copy all .xlsx files from attachments
   xlsx_files.each do |file|
     FileUtils.cp(file, CONTEXT_DIR)
     info "Copied: #{File.basename(file)}", verbose: verbose
