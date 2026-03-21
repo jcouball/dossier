@@ -1,0 +1,224 @@
+#!/usr/bin/env ruby
+#
+# Scans work/attachments/ for image files that look like email junk (signatures,
+# logos, inline images) and interactively asks the user to exclude or keep each one.
+#
+# Decisions are persisted to:
+#   excluded_attachments.txt  -- MD5s to delete before processing (Step 1.1)
+#   included_attachments.txt  -- MD5s confirmed as real content; won't be flagged again
+#
+# Files already in either list are silently skipped.
+# Run with --dry-run to list suspects without prompting or writing files.
+
+require 'digest'
+require 'optparse'
+require 'set'
+
+BASE_DIR      = File.expand_path('..', __dir__)
+ATTACH_DIR    = File.join(BASE_DIR, 'work', 'attachments')
+EXCLUDED_FILE = File.join(BASE_DIR, 'excluded_attachments.txt')
+INCLUDED_FILE = File.join(BASE_DIR, 'included_attachments.txt')
+
+SUSPECT_EXTENSIONS = %w[.jpg .jpeg .png .tiff .tif .gif]
+IMAGE_EXTENSIONS   = SUSPECT_EXTENSIONS
+
+# Outlook inline images are named image001.png, image002.jpg, etc.
+INLINE_IMAGE_RE = /\bimage\d{3,}\b/i
+
+# Images with this many non-whitespace chars of OCR text are treated as real documents.
+OCR_TEXT_THRESHOLD = 100
+
+BAR_WIDTH = 40
+
+SEPARATOR = '=' * 60
+
+# ---------------------------------------------------------------------------
+# Progress bar (scanning phase)
+# ---------------------------------------------------------------------------
+
+def draw_progress(current, total, suspects)
+  return unless $stdout.tty?
+  pct    = total > 0 ? current.to_f / total : 0.0
+  filled = (BAR_WIDTH * pct).round
+  inner  = filled > 0 ? ('=' * (filled - 1)) + (filled < BAR_WIDTH ? '>' : '=') : ''
+  inner  = inner.ljust(BAR_WIDTH)
+  found  = suspects > 0 ? "  \e[33;1m#{suspects} suspect#{suspects == 1 ? '' : 's'} found\e[0m" : ''
+  width  = total.to_s.length
+  print "\rScanning [#{inner}] #{current.to_s.rjust(width)}/#{total}#{found}"
+  $stdout.flush
+end
+
+# ---------------------------------------------------------------------------
+# MD5 list helpers
+# ---------------------------------------------------------------------------
+
+def load_md5_list(path)
+  return Set.new unless File.exist?(path)
+  File.readlines(path, chomp: true)
+      .map(&:strip)
+      .reject { |line| line.empty? || line.start_with?('#') }
+      .to_set
+end
+
+def append_md5(path, md5, filename)
+  File.open(path, 'a') do |f|
+    f.puts "# #{filename}"
+    f.puts md5
+  end
+end
+
+# ---------------------------------------------------------------------------
+# File inspection helpers
+# ---------------------------------------------------------------------------
+
+def image_dimensions(path)
+  out = `identify -format "%w %h" "#{path}" 2>/dev/null`.strip
+  return nil if out.empty?
+  out.split.map(&:to_i)
+end
+
+def image_text_length(path)
+  `tesseract "#{path}" stdout 2>/dev/null`.gsub(/\s+/, '').length
+end
+
+# ---------------------------------------------------------------------------
+# Suspect detection heuristics
+# ---------------------------------------------------------------------------
+
+def suspect?(path)
+  ext  = File.extname(path).downcase
+  name = File.basename(path, ext)
+  size = File.size(path)
+
+  return false unless SUSPECT_EXTENSIONS.include?(ext)
+
+  # Must match at least one size/naming heuristic before paying for OCR
+  looks_suspect = (name =~ INLINE_IMAGE_RE) ||                   # Outlook inline image naming
+                  (size < 20_000) ||                             # Very small (< 20 KB)
+                  ((dims = image_dimensions(path)) && dims[0] < 400 && dims[1] < 400) # Tiny dims
+
+  return false unless looks_suspect
+
+  # If Tesseract finds appreciable text the image is likely a real document
+  return false if image_text_length(path) > OCR_TEXT_THRESHOLD
+
+  true
+end
+
+# ---------------------------------------------------------------------------
+# Display and interaction
+# ---------------------------------------------------------------------------
+
+def show_file_info(path)
+  size  = File.size(path)
+  dims  = image_dimensions(path)
+  chars = image_text_length(path)
+
+  puts "\n#{SEPARATOR}"
+  puts "File:  #{File.basename(path)}"
+  puts "Size:  #{(size / 1024.0).round(1)} KB (#{size} bytes)"
+  puts "Dims:  #{dims ? "#{dims[0]} x #{dims[1]} px" : 'unknown'}"
+  puts "Text:  #{chars} non-whitespace chars (Tesseract)"
+  puts SEPARATOR
+end
+
+def prompt_user(path)
+  show_file_info(path)
+  print 'Opening file... '
+  $stdout.flush
+  system("open \"#{path}\"")
+  sleep 1
+
+  loop do
+    print "\nExclude? [y = exclude & delete  /  n = keep  /  s = skip for now]: "
+    $stdout.flush
+    case $stdin.gets.to_s.strip.downcase
+    when 'y' then return :exclude
+    when 'n' then return :include
+    when 's' then return :skip
+    else puts 'Please enter y, n, or s.'
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+options = { dry_run: false }
+OptionParser.new do |p|
+  p.banner = 'Usage: scripts/detect_excluded_attachments [options]'
+  p.on('-n', '--dry-run', 'List suspects without prompting or writing any files') do
+    options[:dry_run] = true
+  end
+end.parse!
+
+unless Dir.exist?(ATTACH_DIR)
+  $stderr.puts "Error: #{ATTACH_DIR} not found. Run `rake extract` first."
+  exit 1
+end
+
+excluded_md5s = load_md5_list(EXCLUDED_FILE)
+included_md5s = load_md5_list(INCLUDED_FILE)
+
+all_files = SUSPECT_EXTENSIONS.flat_map do |ext|
+  Dir.glob(File.join(ATTACH_DIR, "*#{ext}")) +
+    Dir.glob(File.join(ATTACH_DIR, "*#{ext.upcase}"))
+end.uniq.sort_by { |f| File.basename(f) }
+
+suspects = []
+all_files.each_with_index do |f, i|
+  suspects << f if suspect?(f)
+  draw_progress(i + 1, all_files.size, suspects.size)
+end
+puts if $stdout.tty?
+
+if suspects.empty?
+  puts 'No suspect attachments found.'
+  exit 0
+end
+
+to_review = suspects.reject do |f|
+  md5 = Digest::MD5.file(f).hexdigest
+  excluded_md5s.include?(md5) || included_md5s.include?(md5)
+end
+
+already_decided = suspects.size - to_review.size
+puts "#{suspects.size} suspect(s) found -- #{already_decided} already decided, #{to_review.size} to review."
+
+if to_review.empty?
+  puts 'Nothing left to review.'
+  exit 0
+end
+
+if options[:dry_run]
+  puts "\nDry run -- suspects that would be reviewed:"
+  to_review.each { |f| show_file_info(f) }
+  exit 0
+end
+
+excluded_count = 0
+included_count = 0
+skipped_count  = 0
+
+to_review.each do |path|
+  md5 = Digest::MD5.file(path).hexdigest
+
+  case prompt_user(path)
+  when :exclude
+    File.delete(path)
+    append_md5(EXCLUDED_FILE, md5, File.basename(path))
+    puts '  -> Excluded and deleted.'
+    excluded_count += 1
+  when :include
+    append_md5(INCLUDED_FILE, md5, File.basename(path))
+    puts '  -> Kept and added to included list.'
+    included_count += 1
+  when :skip
+    puts '  -> Skipped (will appear again next run).'
+    skipped_count += 1
+  end
+end
+
+puts "\n#{SEPARATOR}"
+puts "Done.  Excluded: #{excluded_count}  Kept: #{included_count}  Skipped: #{skipped_count}"

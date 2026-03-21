@@ -49,31 +49,19 @@ class ProgressBar
   end
 end
 
-# Array of MD5 checksums to target for deletion
-TARGET_MD5S = [
-  'bfd87e02e5de8d1dc16d3fd2cd9d8507',
-  'dc445961e973e0beffb52836c5074a8a',
-  '6b205fdf9481f75661c92cae90ac64ba',
-  '39aee4c61541e6a2a3ba84ae37a068e3',
-  '15ae7af03334dba790a3f1a793d4faa9',
-  '6929372fd05d30f0d6cde60f7a905d32',
-  '5ed4bf11f65b4aec94b4bded50d01c71',
-  'e3bd398c51dfd9aee3bea863dcb0554b',
-  'c9724ca746eb754d059917e19f82f5c8',
-  'baf739e26a9f8d5816671b627511137c',
-  'c9290011256179f43e2235d14f7be678',
-  'e7b57c9d661b124bd8e06bb0221521a9',
-  'f7709311d2ba2d190cc1c050bf240976',
-  '67bd499763ba8212069cf3e526590396',
-  '67bd499763ba8212069cf3e526590396',
-  '9772db6076f0927e224f85e66ad68f7f',
-  '44560b968eb399433b7b27eb989b3218',
-  'e0f72c1aac05b8541f6d9cec9192c086',
-  'fea4206aef9d99e84ee6545494a9d87a',
-  '220566234a0f2c66708f8d10bd053e11',
-  'a3fa45ce43a7bb42feb92492db09b060',
+MD5_LIST_FILE = File.expand_path('../excluded_attachments.txt', __dir__)
 
-].freeze
+def load_target_md5s(path)
+  unless File.exist?(path)
+    $stderr.puts "Warning: #{path} not found — no files will be excluded"
+    return []
+  end
+  File.readlines(path, chomp: true)
+      .map(&:strip)
+      .reject { |line| line.empty? || line.start_with?('#') }
+end
+
+TARGET_MD5S = load_target_md5s(MD5_LIST_FILE).freeze
 
 options = { verbose: false, show_progress: true }
 OptionParser.new do |parser|

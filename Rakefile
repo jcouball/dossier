@@ -15,32 +15,45 @@ CLOBBER.include('cache/')
 # `rake clobber` — everything in CLEAN plus build artifacts
 CLOBBER.include('Gemfile.lock')
 
+# Require confirmation before clobber deletes the transcription cache
+task :clobber do
+  print "This will delete the OCR/transcription cache (cache/), which may take hours to rebuild.\nType CLOBBER to confirm: "
+  $stdout.flush
+  abort "Aborted." unless $stdin.gets.to_s.strip == 'CLOBBER'
+end
+
 desc "Step 1: Extract from MBOX"
 task :extract do
   puts "--- [1] Extracting from MBOX ---"
   system "scripts/import_mbox"
 end
 
-desc "Step 1.1: Remove known junk files by MD5"
-task :filter_md5 => :extract do
-  puts "--- [1.1] Filtering known junk (MD5) ---"
-  system "scripts/delete_by_md5"
+desc "Interactively review suspect attachments (run after rake extract)"
+task :detect_excluded_attachments do
+  puts "--- [1.x] Detecting junk attachments (interactive) ---"
+  system "scripts/detect_excluded_attachments"
+end
+
+desc "Step 1.1: Delete excluded attachments by MD5"
+task :delete_excluded_attachments => :extract do
+  puts "--- [1.1] Deleting excluded attachments ---"
+  system "scripts/delete_excluded_attachments"
 end
 
 desc "Step 1.2: Remove duplicate attachments"
-task :dedupe => :filter_md5 do
+task :deduplicate_attachments => :delete_excluded_attachments do
   puts "--- [1.2] Deduplicating Attachments ---"
-  system "scripts/deduplicate -d"
+  system "scripts/deduplicate_attachments -d"
 end
 
 desc "Step 2: Compile email narrative (depends on dedupe)"
-task :compile_emails => :dedupe do
+task :compile_emails => :deduplicate_attachments do
   puts "--- [2] Compiling Email Narrative ---"
   system "scripts/compile_emails"
 end
 
 desc "Step 3: Compile/OCR attachments (depends on dedupe)"
-task :compile_docs => :dedupe do
+task :compile_docs => :deduplicate_attachments do
   puts "--- [3] Compiling Attachment Text (with OCR) ---"
   system "scripts/transcribe_attachments"
 end
