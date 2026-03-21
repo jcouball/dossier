@@ -24,6 +24,8 @@ THREAD_POOL_SIZE    = 5
 CLAUDE_MAX_RETRIES  = 6     # up to ~2 min total wait
 CLAUDE_RETRY_BASE   = 2.0   # seconds; delay = base^attempt (2, 4, 8, 16, 32, 64)
 
+IMAGE_EXTENSIONS = %w[.jpg .jpeg .png .tiff .tif].freeze
+
 TRANSCRIBE_PROMPT = <<~PROMPT.freeze
   Transcribe all text visible in this image exactly as it appears. This is a page from a legal or financial document related to a family court case and may include court filings, FOIA responses, probate records, financial statements, legal agreements, correspondence, or government forms.
 
@@ -44,6 +46,20 @@ SUMMARY_PROMPT = <<~PROMPT.freeze
   PARTIES: <names of people or organizations involved, comma-separated>
   SUBJECT: <one sentence describing what this document is about>
   KEY_FACTS: <2-5 bullet points of the most important facts, each starting with "- ">
+PROMPT
+
+# Used when the source file is a photo/image rather than a scanned document.
+# Claude sees the actual pixels directly rather than OCR'd text.
+IMAGE_SUMMARY_PROMPT = <<~PROMPT.freeze
+  You are analyzing a photo or image attached to an email in a legal case file.
+  Describe what you see and respond with ONLY the fields below, exactly as formatted.
+  Do not add any explanation or extra text.
+
+  DOCUMENT_TYPE: <one of: Court, Financial, Medical, Other>
+  DATE: <any date visible in or clearly associated with the image, or "Unknown">
+  PARTIES: <names of any people or organizations visible or identifiable, comma-separated, or "Unknown">
+  SUBJECT: <one sentence describing what this image shows>
+  KEY_FACTS: <2-5 bullet points of the most important observable details, each starting with "- ">
 PROMPT
 
 def timestamp = Time.now.strftime('%H:%M:%S')
@@ -195,18 +211,37 @@ end
 def claude_transcribe_image(img_path)
   info("  [Claude] Sending image: #{File.basename(img_path)}", verbose: $verbose)
   Dir.mktmpdir do |dir|
-    # Resize to keep under the 5 MB API limit; shrink progressively if needed
-    max_bytes = 5 * 1024 * 1024
-    src = img_path
+    max_bytes  = 4 * 1024 * 1024  # stay comfortably under the 5 MB API limit
+    src        = img_path
+    media_type = 'image/jpeg'
+
     if CONVERT_AVAILABLE
-      resized = File.join(dir, 'resized.png')
-      dim = 2000
+      resized = File.join(dir, 'resized.jpg')
+      dim     = 2000
+      quality = 85
       loop do
-        system("convert '#{img_path}' -resize '#{dim}x#{dim}>' '#{resized}' 2>/dev/null")
-        break if !File.exist?(resized) || File.size(resized) <= max_bytes || dim <= 500
-        dim = (dim * 0.75).round
+        system("convert '#{img_path}' -resize '#{dim}x#{dim}>' -quality #{quality} '#{resized}' 2>/dev/null")
+        break if !File.exist?(resized) || File.size(resized) <= max_bytes
+        if dim > 400
+          dim = (dim * 0.75).round
+        elsif quality > 30
+          quality -= 20
+        else
+          break
+        end
       end
-      src = resized if File.exist?(resized) && File.size(resized) <= max_bytes
+      if File.exist?(resized) && File.size(resized) <= max_bytes
+        src        = resized
+        media_type = 'image/jpeg'
+      else
+        media_type = case File.extname(img_path).downcase
+          when '.jpg', '.jpeg' then 'image/jpeg'
+          when '.png'          then 'image/png'
+          when '.gif'          then 'image/gif'
+          when '.tif', '.tiff' then 'image/tiff'
+          else                      'image/jpeg'
+          end
+      end
     end
     data = Base64.strict_encode64(File.binread(src))
 
@@ -221,7 +256,7 @@ def claude_transcribe_image(img_path)
         messages: [{
           role: 'user',
           content: [
-            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: data } },
+            { type: 'image', source: { type: 'base64', media_type: media_type, data: data } },
             { type: 'text', text: TRANSCRIBE_PROMPT }
           ]
         }]
@@ -393,6 +428,65 @@ rescue => e
   nil
 end
 
+# Generate an AI summary by sending the image directly to Claude (vision).
+# Used for photo/image attachments where OCR text would be meaningless.
+def claude_summarize_image(img_path, filename)
+  return nil unless $use_ai && CLAUDE_AVAILABLE
+  Dir.mktmpdir do |dir|
+    max_bytes = 4 * 1024 * 1024  # stay comfortably under the 5 MB API limit
+    src        = img_path
+    media_type = 'image/jpeg'
+
+    if CONVERT_AVAILABLE
+      resized = File.join(dir, 'resized.jpg')
+      dim     = 1600
+      quality = 80
+      loop do
+        system("convert '#{img_path}' -resize '#{dim}x#{dim}>' -quality #{quality} '#{resized}' 2>/dev/null")
+        break if !File.exist?(resized) || File.size(resized) <= max_bytes
+        if dim > 400
+          dim = (dim * 0.7).round
+        elsif quality > 30
+          quality -= 20
+        else
+          break  # give up shrinking; the API call will fail gracefully
+        end
+      end
+      if File.exist?(resized) && File.size(resized) <= max_bytes
+        src        = resized
+        media_type = 'image/jpeg'
+      else
+        # Could not shrink enough; detect the native type and send as-is
+        media_type = case File.extname(img_path).downcase
+          when '.jpg', '.jpeg' then 'image/jpeg'
+          when '.png'          then 'image/png'
+          when '.gif'          then 'image/gif'
+          when '.tif', '.tiff' then 'image/tiff'
+          else                      'image/jpeg'
+          end
+      end
+    end
+
+    data   = Base64.strict_encode64(File.binread(src))
+    client = Anthropic::Client.new(timeout: 60, max_retries: 0)
+    response = client.messages.create(
+      model: CLAUDE_MODEL,
+      max_tokens: 512,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: media_type, data: data } },
+          { type: 'text', text: IMAGE_SUMMARY_PROMPT }
+        ]
+      }]
+    )
+    response.content.first.text.strip
+  end
+rescue => e
+  warning("Claude image summary error for #{filename}: #{e.message}")
+  nil
+end
+
 def format_summary_header(summary, filename, generated_at)
   <<~HEADER
     <<<SUMMARY
@@ -454,7 +548,11 @@ def run(verbose:, show_progress:)
 
     $progress_bar&.status = "#{short_name(file)} [Fetching Summary]"
     info("  [Claude] Generating summary for #{filename}...", verbose: verbose)
-    summary = claude_summarize(clean_text, filename)
+    summary = if IMAGE_EXTENSIONS.include?(ext) && $use_ai && CLAUDE_AVAILABLE
+      claude_summarize_image(file, filename)
+    else
+      claude_summarize(clean_text, filename)
+    end
     header  = summary ? format_summary_header(summary, filename, Time.now) : ''
 
     File.write(File.join(TEXT_DIR, "#{filename}.txt"), header + clean_text)
@@ -481,7 +579,12 @@ def run(verbose:, show_progress:)
 
         sum_bar.status = "#{short_name(file)} [Fetching Summary]"
         info("  [Claude] Generating summary for #{filename}...", verbose: verbose)
-        summary = claude_summarize(existing, filename)
+        ext = File.extname(file).downcase
+        summary = if IMAGE_EXTENSIONS.include?(ext) && $use_ai && CLAUDE_AVAILABLE
+          claude_summarize_image(file, filename)
+        else
+          claude_summarize(existing, filename)
+        end
         header = if summary
           format_summary_header(summary, filename, Time.now)
         else
