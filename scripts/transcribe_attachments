@@ -6,6 +6,7 @@ require 'optparse'
 require 'base64'
 require 'dotenv/load'
 require 'anthropic'
+require 'roo'
 
 BASE_DIR     = File.expand_path('..', __dir__)
 ATTACH_DIR   = File.join(BASE_DIR, 'work', 'attachments')
@@ -25,6 +26,7 @@ CLAUDE_MAX_RETRIES  = 6     # up to ~2 min total wait
 CLAUDE_RETRY_BASE   = 2.0   # seconds; delay = base^attempt (2, 4, 8, 16, 32, 64)
 
 IMAGE_EXTENSIONS = %w[.jpg .jpeg .png .tiff .tif].freeze
+SPREADSHEET_EXTENSIONS = %w[.xlsx].freeze
 
 TRANSCRIBE_PROMPT = <<~PROMPT.freeze
   Transcribe all text visible in this image exactly as it appears. This is a page from a legal or financial document related to a family court case and may include court filings, FOIA responses, probate records, financial statements, legal agreements, correspondence, or government forms.
@@ -181,6 +183,25 @@ def process_pdf_pages_parallel(file_path, pages, verbose:, progress_bar:)
   end.each(&:join)
 end
 
+# Extract a plain-text representation of an xlsx spreadsheet for AI summarization.
+def extract_xlsx_text(file_path)
+  xlsx = Roo::Spreadsheet.open(file_path)
+  result = []
+  xlsx.sheets.each do |sheet_name|
+    sheet = xlsx.sheet(sheet_name)
+    result << "=== Sheet: #{sheet_name} ==="
+    (sheet.first_row..sheet.last_row).each do |row|
+      cells = (sheet.first_column..sheet.last_column).map { |col| sheet.cell(row, col).to_s.strip }
+      result << cells.join(" | ")
+    end
+    result << ""
+  end
+  result.join("\n")
+rescue => e
+  warning("Failed to read xlsx #{File.basename(file_path)}: #{e.message}")
+  ""
+end
+
 def extract_text(file_path, extension, verbose: false, progress_bar: nil)
   case extension
   when '.docx', '.doc', '.rtf'
@@ -200,6 +221,8 @@ def extract_text(file_path, extension, verbose: false, progress_bar: nil)
     (1..pages).map { |n| File.read(page_cache_path(filename, n)) }.join("\n\n")
   when '.txt'
     File.read(file_path) rescue ""
+  when '.xlsx'
+    extract_xlsx_text(file_path)
   else
     ""
   end
@@ -526,7 +549,7 @@ def run(verbose:, show_progress:)
   FileUtils.mkdir_p(TEXT_DIR)
 
   source_dirs = [ATTACH_DIR, SIDELOAD_DIR].select { |d| Dir.exist?(d) }
-  all_files = ['.pdf', '.docx', '.doc', '.rtf', '.txt', '.jpg', '.jpeg', '.png', '.tiff', '.tif'].flat_map do |ext|
+  all_files = ['.pdf', '.docx', '.doc', '.rtf', '.txt', '.jpg', '.jpeg', '.png', '.tiff', '.tif', '.xlsx'].flat_map do |ext|
     source_dirs.flat_map { |dir| Dir.glob(File.join(dir, "*#{ext}")) }
   end.sort_by { |f| File.basename(f) }
 
@@ -555,7 +578,9 @@ def run(verbose:, show_progress:)
     end
     header  = summary ? format_summary_header(summary, filename, Time.now) : ''
 
-    File.write(File.join(TEXT_DIR, "#{filename}.txt"), header + clean_text)
+    # For spreadsheets, store only the summary (no body text)
+    body = SPREADSHEET_EXTENSIONS.include?(ext) ? '' : clean_text
+    File.write(File.join(TEXT_DIR, "#{filename}.txt"), header + body)
     Dir.glob(File.join(PAGE_CACHE_DIR, "#{filename}.p*.txt")).each { |f| File.delete(f) }
     bar.advance
   end
@@ -580,10 +605,12 @@ def run(verbose:, show_progress:)
         sum_bar.status = "#{short_name(file)} [Fetching Summary]"
         info("  [Claude] Generating summary for #{filename}...", verbose: verbose)
         ext = File.extname(file).downcase
+        # For xlsx files, re-extract text for summarization (cache has no body)
+        summarize_text = SPREADSHEET_EXTENSIONS.include?(ext) ? normalize_text(extract_xlsx_text(file)) : existing
         summary = if IMAGE_EXTENSIONS.include?(ext) && $use_ai && CLAUDE_AVAILABLE
           claude_summarize_image(file, filename)
         else
-          claude_summarize(existing, filename)
+          claude_summarize(summarize_text, filename)
         end
         header = if summary
           format_summary_header(summary, filename, Time.now)
@@ -591,7 +618,9 @@ def run(verbose:, show_progress:)
           warning("Summary unavailable for #{filename} — writing stub to skip on future runs")
           "<<<SUMMARY\nFILE: #{filename}\nGENERATED: #{Time.now}\nDOCUMENT_TYPE: Other\nDATE: Unknown\nPARTIES: \nSUBJECT: (summary unavailable)\nKEY_FACTS: \nSUMMARY>>>\n\n"
         end
-        File.write(text_path, header + existing)
+        # For spreadsheets, store only the summary (no body text)
+        body = SPREADSHEET_EXTENSIONS.include?(ext) ? '' : existing
+        File.write(text_path, header + body)
         sum_bar.advance
       end
     end
@@ -611,7 +640,7 @@ def run(verbose:, show_progress:)
   end
 
   # --- Index file: summaries only ---
-  index_path = File.join(BASE_DIR, 'work', 'index.txt')
+  index_path = File.join(BASE_DIR, 'work', 'docs_index.txt')
   File.open(index_path, 'w') do |f|
     f.puts "DOCUMENT INDEX - #{Time.now}"
     f.puts "===================================================="
@@ -626,33 +655,28 @@ def run(verbose:, show_progress:)
   end
   info("Index written: #{index_path}", verbose: verbose)
 
-  # --- Split files by document type ---
-  # Remove stale docs_*.txt files from previous runs before writing new ones
-  Dir.glob(File.join(BASE_DIR, 'work', 'docs_*.txt')).each { |f| File.delete(f) }
-  type_groups = docs.group_by { |d| d[:meta][:document_type] }
-  type_files  = {}
-  type_groups.each do |doc_type, group|
-    safe_type = doc_type.downcase.gsub(/[^a-z0-9]+/, '_').gsub(/^_|_$/, '')
-    type_path = File.join(BASE_DIR, 'work', "docs_#{safe_type}.txt")
-    type_files[doc_type] = type_path
-    File.open(type_path, 'w') do |f|
-      f.puts "#{doc_type.upcase} DOCUMENTS - #{Time.now}"
-      f.puts "===================================================="
-      f.puts "#{group.size} document(s)\n\n"
-      group.each do |doc|
-        f.puts "FILE_START [#{doc[:id].to_s.rjust(3, '0')}]: #{doc[:filename]}"
-        f.puts "----------------------------------------------------"
-        f.puts doc[:content]
-        f.puts "\n----------------------------------------------------"
-        f.puts "FILE_END [#{doc[:id].to_s.rjust(3, '0')}]: #{doc[:filename]}\n\n"
-      end
+  # --- Combined document file ---
+  # Remove stale docs*.txt files from previous runs before writing new ones
+  Dir.glob(File.join(BASE_DIR, 'work', 'docs_*.txt')).each { |f| File.delete(f) unless f == index_path }
+  docs_path = File.join(BASE_DIR, 'work', 'docs.txt')
+  File.delete(docs_path) if File.exist?(docs_path)
+  File.open(docs_path, 'w') do |f|
+    f.puts "ALL DOCUMENTS - #{Time.now}"
+    f.puts "===================================================="
+    f.puts "#{docs.size} document(s)\n\n"
+    docs.each do |doc|
+      f.puts "FILE_START [#{doc[:id].to_s.rjust(3, '0')}]: #{doc[:filename]}"
+      f.puts "----------------------------------------------------"
+      f.puts doc[:content]
+      f.puts "\n----------------------------------------------------"
+      f.puts "FILE_END [#{doc[:id].to_s.rjust(3, '0')}]: #{doc[:filename]}\n\n"
     end
-    info("  Written: #{File.basename(type_path)} (#{group.size} docs)", verbose: verbose)
   end
+  info("  Written: docs.txt (#{docs.size} docs)", verbose: verbose)
 
   info("\nSuccess! Outputs written to work/:", verbose: verbose)
-  info("  index.txt (summaries only)", verbose: verbose)
-  type_files.each { |type, path| info("  #{File.basename(path)}", verbose: verbose) }
+  info("  docs_index.txt (summaries only)", verbose: verbose)
+  info("  docs.txt (all documents)", verbose: verbose)
 end
 
 options = { verbose: false, show_progress: true, use_ai: true, ai_all_pages: true }
