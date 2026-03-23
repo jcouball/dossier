@@ -21,3 +21,7 @@ Gemfile.lock
 # User configuration (private — contains case-specific MD5s)
 excluded_attachments.txt
 included_attachments.txt
+
+# Other private data
+/prompt.md
+/*.txt
