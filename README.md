@@ -114,7 +114,7 @@ This runs all the extraction in order. You can also run individual steps:
 | `rake delete_excluded_attachments` | Step 1.1 — Delete attachments listed in `excluded_attachments.txt` by MD5 |
 | `rake deduplicate_attachments` | Step 1.2 — Remove duplicate attachments |
 | `rake compile_emails` | Step 2 — Build `work/emails.txt` |
-| `rake compile_docs` | Step 3 — Transcribe attachments, build `work/index.txt` and `work/docs_*.txt` (uses Claude + OCR cache) |
+| `rake compile_docs` | Step 3 — Transcribe attachments, build `work/docs_index.txt` and `work/docs.txt` (uses Claude + OCR cache) |
 | `rake sync` | Step 4 — Sync everything to `context/` |
 | `rake clean` | Remove all generated output files (`work/`, `context/`) |
 | `rake clobber` | Clean + remove the OCR/transcription cache (`cache/`) and `Gemfile.lock` |
@@ -136,9 +136,9 @@ To use these flags, run `scripts/transcribe_attachments` directly instead of via
 After `rake sync`, the `context/` directory contains:
 
 - `emails.txt` — All emails in chronological order, plain text
-- `index.txt` — AI-generated one-line summary per document, sorted by date
-- `docs_<type>.txt` — Attachments grouped by document type (`docs_court.txt`,
-  `docs_financial.txt`, `docs_medical.txt`, `docs_other.txt`)
+- `docs_index.txt` — AI-generated summary per document (type, date, parties,
+  subject, keywords), sorted by filename
+- `docs.txt` — Full text of all documents combined
 - `*.xlsx` — Spreadsheet attachments (copied directly)
 
 Upload this directory to any AI tool for review.
